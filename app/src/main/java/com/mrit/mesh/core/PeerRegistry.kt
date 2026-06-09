@@ -4,14 +4,14 @@ import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import javax.crypto.SecretKey
 
 /**
- * PeerRegistry — thread-safe table of all currently reachable mesh peers.
+ * PeerRegistry — thread-safe table of all reachable mesh peers.
  *
- * This is the routing table's companion: the router decides WHERE to send
- * (next-hop MeshID), and the registry resolves HOW to reach them (IP address).
- *
- * Emits [peers] as a StateFlow so the UI can observe the live peer list.
+ * Phase 3 addition:
+ *   Caches the per-peer AES-256 shared key (derived via ECDH during handshake).
+ *   MeshNode calls [storeSharedKey] once per peer, then [getSharedKey] per message.
  */
 class PeerRegistry {
 
@@ -19,53 +19,41 @@ class PeerRegistry {
         private const val TAG = "PeerRegistry"
     }
 
-    // meshId hex string → PeerInfo
-    private val table = HashMap<String, PeerInfo>()
-    private val lock  = Any()
+    private val table       = HashMap<String, PeerInfo>()   // meshId hex → PeerInfo
+    private val sharedKeys  = HashMap<String, SecretKey>()  // meshId hex → AES-256 key
+    private val lock        = Any()
 
     private val _peers = MutableStateFlow<List<PeerInfo>>(emptyList())
-
-    /** Live list of all currently registered peers — observe this in UI */
     val peers: StateFlow<List<PeerInfo>> = _peers.asStateFlow()
 
-    // ── Write operations ───────────────────────────────────────────────────────
+    // ── Write ──────────────────────────────────────────────────────────────────
 
-    /**
-     * Register or update a peer.
-     * If the peer already exists, its IP and last-seen time are refreshed.
-     */
+    /** Register or update a peer. Preserves existing BLE address and public key if absent. */
     fun register(peer: PeerInfo) {
         synchronized(lock) {
-            val key = peer.meshId.toString()
+            val key      = peer.meshId.toString()
             val existing = table[key]
-            table[key] = if (existing != null) {
-                // Preserve BLE address if we already knew it
-                peer.copy(bleAddress = peer.bleAddress ?: existing.bleAddress)
-            } else {
-                peer
-            }
+            table[key]   = peer.copy(
+                bleAddress = peer.bleAddress ?: existing?.bleAddress,
+                publicKey  = peer.publicKey  ?: existing?.publicKey
+            )
             publishUpdate()
         }
         Log.d(TAG, "Registered $peer")
     }
 
-    /**
-     * Remove a peer — called when WiFi Direct disconnects.
-     */
+    /** Remove a peer when WiFi Direct disconnects. */
     fun remove(meshId: MeshID) {
         synchronized(lock) {
-            val removed = table.remove(meshId.toString())
-            if (removed != null) {
+            if (table.remove(meshId.toString()) != null) {
+                sharedKeys.remove(meshId.toString())
                 publishUpdate()
                 Log.d(TAG, "Removed peer ${meshId.shortId()}")
             }
         }
     }
 
-    /**
-     * Refresh the last-seen timestamp for a peer.
-     * Called every time we receive any packet from them.
-     */
+    /** Refresh last-seen timestamp. Call on every received packet. */
     fun touch(meshId: MeshID) {
         synchronized(lock) {
             val key = meshId.toString()
@@ -74,14 +62,14 @@ class PeerRegistry {
         }
     }
 
-    /**
-     * Remove peers we haven't heard from in over [timeoutMs] milliseconds.
-     * Call this periodically (e.g. every 30 s).
-     */
+    /** Remove peers not heard from in [timeoutMs] ms. */
     fun removeStale(timeoutMs: Long = 60_000L) {
         synchronized(lock) {
             val stale = table.entries.filter { it.value.isStale(timeoutMs) }.map { it.key }
-            stale.forEach { table.remove(it) }
+            stale.forEach {
+                table.remove(it)
+                sharedKeys.remove(it)
+            }
             if (stale.isNotEmpty()) {
                 publishUpdate()
                 Log.d(TAG, "Removed ${stale.size} stale peers")
@@ -89,30 +77,37 @@ class PeerRegistry {
         }
     }
 
-    // ── Read operations ────────────────────────────────────────────────────────
+    // ── Phase 3: shared key cache ──────────────────────────────────────────────
 
     /**
-     * Look up the IP address to reach a given MeshID.
-     * Returns null if we don't have a direct connection to this peer.
+     * Cache the ECDH-derived AES-256 shared key for a peer.
+     * Called once after handshake completes.
      */
+    fun storeSharedKey(meshId: MeshID, key: SecretKey) {
+        synchronized(lock) { sharedKeys[meshId.toString()] = key }
+        Log.d(TAG, "Shared key stored for ${meshId.shortId()}")
+    }
+
+    /**
+     * Retrieve the shared AES-256 key for encrypting/decrypting messages with a peer.
+     * Returns null if handshake hasn't completed yet.
+     */
+    fun getSharedKey(meshId: MeshID): SecretKey? =
+        synchronized(lock) { sharedKeys[meshId.toString()] }
+
+    // ── Read ───────────────────────────────────────────────────────────────────
+
     fun getIpFor(meshId: MeshID): String? =
         synchronized(lock) { table[meshId.toString()]?.ipAddress }
 
-    /**
-     * Returns a snapshot of all registered peers.
-     */
+    fun get(meshId: MeshID): PeerInfo? =
+        synchronized(lock) { table[meshId.toString()] }
+
     fun getAll(): List<PeerInfo> =
         synchronized(lock) { table.values.toList() }
 
-    /**
-     * True if at least one peer is currently registered.
-     */
-    fun isEmpty(): Boolean = synchronized(lock) { table.isEmpty() }
-
-    /** Total number of registered peers */
-    fun count(): Int = synchronized(lock) { table.size }
-
-    // ── Internal ───────────────────────────────────────────────────────────────
+    fun isEmpty(): Boolean  = synchronized(lock) { table.isEmpty() }
+    fun count(): Int        = synchronized(lock) { table.size }
 
     private fun publishUpdate() {
         _peers.tryEmit(table.values.toList())

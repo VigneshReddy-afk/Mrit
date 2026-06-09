@@ -10,6 +10,7 @@ import android.util.Log
 import com.mrit.mesh.core.MeshID
 import com.mrit.mesh.core.MeshPacket
 import com.mrit.mesh.core.PacketType
+import com.mrit.mesh.crypto.KeyManager
 import com.mrit.mesh.protocol.MMPDecoder
 import com.mrit.mesh.protocol.MMPEncoder
 import kotlinx.coroutines.*
@@ -37,7 +38,8 @@ import java.net.Socket
  */
 class WifiDirectTransport(
     private val context: Context,
-    private val ourId: MeshID          // ← Phase 2: needed for handshake packets
+    private val ourId: MeshID,
+    private val keyManager: KeyManager   // ← Phase 3: public key embedded in DISCOVER
 ) {
 
     companion object {
@@ -151,7 +153,7 @@ class WifiDirectTransport(
 
     /**
      * CLIENT-SIDE handshake.
-     * Sends our DISCOVER packet → receives owner's DISCOVER → emits PeerHandshake.
+     * Sends our DISCOVER packet (with public key) → receives owner's DISCOVER → emits PeerHandshake.
      */
     private fun performHandshakeAsClient(ownerIp: String) {
         scope.launch {
@@ -167,7 +169,11 @@ class WifiDirectTransport(
                     // 2. Receive owner's DISCOVER
                     val packet = readPacket(input)
                     if (packet?.type == PacketType.DISCOVER) {
-                        val handshake = PeerHandshake(meshId = packet.srcId, ipAddress = ownerIp)
+                        val handshake = PeerHandshake(
+                            meshId         = packet.srcId,
+                            ipAddress      = ownerIp,
+                            publicKeyBytes = packet.payload   // ← Phase 3
+                        )
                         _peerHandshakes.emit(handshake)
                         Log.d(TAG, "Handshake complete — owner is ${packet.srcId.shortId()} at $ownerIp")
                     }
@@ -194,7 +200,11 @@ class WifiDirectTransport(
             sendDiscover(out)
 
             // 2. Record the peer
-            val handshake = PeerHandshake(meshId = clientDiscover.srcId, ipAddress = clientIp)
+            val handshake = PeerHandshake(
+                meshId         = clientDiscover.srcId,
+                ipAddress      = clientIp,
+                publicKeyBytes = clientDiscover.payload   // ← Phase 3
+            )
             _peerHandshakes.emit(handshake)
             Log.d(TAG, "Handshake complete — client is ${clientDiscover.srcId.shortId()} at $clientIp")
         } catch (e: Exception) {
@@ -269,12 +279,17 @@ class WifiDirectTransport(
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
+    /**
+     * Build a DISCOVER (handshake) packet.
+     * Phase 3: payload = our EC P-256 public key bytes (X.509 DER, ~91 bytes)
+     * The receiver uses this to compute the ECDH shared key.
+     */
     private fun buildDiscoverPacket(): MeshPacket = MeshPacket(
         type    = PacketType.DISCOVER,
         srcId   = ourId,
         dstId   = MeshID.BROADCAST,
-        ttl     = 1,                  // Handshake never hops — TTL=1
-        payload = ByteArray(0)
+        ttl     = 1,                          // Handshake never hops — TTL=1
+        payload = keyManager.publicKeyBytes   // ← Phase 3: public key in payload
     )
 
     private fun sendDiscover(out: DataOutputStream) = writePacket(out, buildDiscoverPacket())
@@ -297,10 +312,12 @@ class WifiDirectTransport(
     // ── Data model ────────────────────────────────────────────────────────────
 
     /**
-     * Result of a completed handshake — we now know this peer's MeshID and IP.
+     * Result of a completed handshake.
+     * Phase 3: also carries the peer's raw public key bytes for ECDH key derivation.
      */
     data class PeerHandshake(
         val meshId: MeshID,
-        val ipAddress: String
+        val ipAddress: String,
+        val publicKeyBytes: ByteArray = ByteArray(0)   // ← Phase 3
     )
 }

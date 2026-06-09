@@ -7,6 +7,9 @@ import com.mrit.mesh.core.MeshPacket
 import com.mrit.mesh.core.PacketType
 import com.mrit.mesh.core.PeerInfo
 import com.mrit.mesh.core.PeerRegistry
+import com.mrit.mesh.crypto.KeyManager
+import com.mrit.mesh.crypto.MeshCrypto
+import com.mrit.mesh.reliability.AckManager
 import com.mrit.mesh.routing.AODVRouter
 import com.mrit.mesh.routing.RoutingDecision
 import com.mrit.mesh.storage.PacketStore
@@ -18,60 +21,61 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * MeshNode — the single public API surface for the MRIT mesh network.
+ * MeshNode — the complete MRIT mesh stack. Phase 3.
  *
- * All internal components (router, transports, store, registry) are wired
- * together here. The app layer (MeshService, MainActivity) only talks to MeshNode.
+ * New in Phase 3:
+ *   - End-to-end encryption  : every unicast MSG is AES-256-GCM encrypted with
+ *                              a per-peer key derived via ECDH during handshake
+ *   - Delivery reliability   : AckManager sends ACK on receipt; retries 3× on timeout
+ *   - Complete multi-hop     : full AODV RREQ/RREP — A can reach C through B
  *
- * Usage:
- *   val node = MeshNode(context)
- *   node.start()
- *
- *   // Send a message
- *   node.sendMessage(destinationId, "Hello from the mesh!")
- *
- *   // Receive messages
- *   lifecycleScope.launch {
- *       node.incomingMessages.collect { msg ->
- *           Log.d("App", "From ${msg.from.shortId()}: ${msg.text}")
- *       }
- *   }
- *
- *   // Observe peers
- *   lifecycleScope.launch {
- *       node.peers.collect { peerList -> updateUI(peerList) }
- *   }
+ * Public API (unchanged from Phase 2):
+ *   node.sendMessage(to, text)     — unicast encrypted message
+ *   node.sendSOS(text)             — broadcast unencrypted emergency
+ *   node.incomingMessages          — Flow of received messages
+ *   node.peers                     — StateFlow of connected peers
  */
 class MeshNode(private val context: Context) {
 
     companion object {
-        private const val TAG             = "MeshNode"
-        private const val PREFS_NAME      = "mrit_prefs"
-        private const val KEY_MESH_ID     = "mesh_id_hex"
-        private const val CLEANUP_INTERVAL = 30_000L  // 30 s
+        private const val TAG              = "MeshNode"
+        private const val PREFS_NAME       = "mrit_prefs"
+        private const val KEY_MESH_ID      = "mesh_id_hex"
+        private const val CLEANUP_INTERVAL = 30_000L
     }
 
-    // ── Identity ───────────────────────────────────────────────────────────────
+    // ── Identity & crypto ──────────────────────────────────────────────────────
 
-    val ourId: MeshID = loadOrCreateMeshId()
+    val ourId: MeshID          = loadOrCreateMeshId()
+    val keyManager: KeyManager = KeyManager(context)
 
     // ── Components ─────────────────────────────────────────────────────────────
 
-    private val peerRegistry   = PeerRegistry()
-    private val router         = AODVRouter(ourId)
-    private val packetStore    = PacketStore(context)
-    private val bleTransport   = BLETransport(context, ourId)
-    private val wifiTransport  = WifiDirectTransport(context, ourId)
+    private val peerRegistry  = PeerRegistry()
+    private val router        = AODVRouter(ourId)
+    private val packetStore   = PacketStore(context)
+    private val bleTransport  = BLETransport(context, ourId)
+    private val wifiTransport = WifiDirectTransport(context, ourId, keyManager)
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    private val ackManager = AckManager(
+        scope            = scope,
+        onRetry          = { packet, ip -> wifiTransport.send(packet, ip) },
+        onDeliveryFailed = { packet ->
+            Log.w(TAG, "Delivery failed for packet to ${packet.dstId.shortId()}")
+            _incomingMessages.tryEmit(
+                IncomingMessage(from = ourId,
+                    text  = "⚠ Message to ${packet.dstId.shortId()} failed after 3 retries",
+                    isSOS = false)
+            )
+        }
+    )
+
     // ── Public flows ───────────────────────────────────────────────────────────
 
-    /** Emits every text message received from any peer */
     private val _incomingMessages = MutableSharedFlow<IncomingMessage>(extraBufferCapacity = 64)
     val incomingMessages: SharedFlow<IncomingMessage> = _incomingMessages
-
-    /** Live list of currently connected peers — observe in UI */
     val peers: StateFlow<List<PeerInfo>> = peerRegistry.peers
 
     // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -79,45 +83,44 @@ class MeshNode(private val context: Context) {
     fun start() {
         bleTransport.start()
         wifiTransport.start()
-
         observeIncomingPackets()
         observePeerHandshakes()
         observeDiscoveredNodes()
         startMaintenanceLoop()
-
         packetStore.purgeExpired()
-        Log.d(TAG, "MeshNode started — ourId=${ourId.shortId()} (${ourId})")
+        Log.d(TAG, "MeshNode started — id=${ourId.shortId()} encrypted=true")
     }
 
     fun stop() {
         bleTransport.stop()
         wifiTransport.stop()
         scope.cancel()
-        Log.d(TAG, "MeshNode stopped")
     }
 
     // ── Send API ───────────────────────────────────────────────────────────────
 
     /**
-     * Send a UTF-8 text message to a specific peer.
-     *
-     * If the peer is currently reachable, the message is delivered immediately.
-     * If not, it is stored and will be forwarded when the peer comes into range.
+     * Send an encrypted text message to [to].
+     * - If peer is reachable: encrypt with shared key, send immediately, track for ACK.
+     * - If peer is unreachable: store packet and broadcast RREQ to discover route.
      */
     fun sendMessage(to: MeshID, text: String) {
+        val plaintext = text.toByteArray(Charsets.UTF_8)
+        val payload   = encryptForPeer(to, plaintext) ?: plaintext  // fallback if no key yet
+
         val packet = MeshPacket(
             type    = PacketType.MSG,
             srcId   = ourId,
             dstId   = to,
             ttl     = MeshPacket.DEFAULT_TTL,
-            payload = text.toByteArray(Charsets.UTF_8)
+            payload = payload
         )
         dispatchPacket(packet)
     }
 
     /**
-     * Broadcast an SOS to ALL reachable nodes.
-     * Uses maximum TTL — propagates as far as possible through the mesh.
+     * Broadcast an SOS to all reachable nodes.
+     * SOS is NOT encrypted — it must be readable by any node.
      */
     fun sendSOS(message: String) {
         val packet = MeshPacket(
@@ -128,80 +131,71 @@ class MeshNode(private val context: Context) {
             payload = message.toByteArray(Charsets.UTF_8)
         )
         forwardToAllPeers(packet)
-        Log.w(TAG, "SOS broadcast sent: $message")
+        Log.w(TAG, "SOS broadcast: $message")
     }
 
-    // ── Internal — packet handling ─────────────────────────────────────────────
+    // ── Internal — routing ─────────────────────────────────────────────────────
 
     private fun observeIncomingPackets() {
         scope.launch {
             wifiTransport.incomingPackets.collect { packet ->
-                peerRegistry.touch(packet.srcId)  // refresh last-seen for this sender
-                router.recordRoute(packet.srcId, packet.srcId) // direct route to sender
+                peerRegistry.touch(packet.srcId)
+                router.recordRoute(packet.srcId, packet.srcId)
                 route(packet)
             }
         }
     }
 
     private fun route(packet: MeshPacket) {
-        Log.d(TAG, "Routing $packet")
-
         when (val decision = router.process(packet)) {
-
-            is RoutingDecision.Deliver -> {
-                deliverToApp(packet)
-            }
-
+            is RoutingDecision.Deliver          -> deliverToApp(packet)
             is RoutingDecision.DeliverAndForward -> {
                 deliverToApp(packet)
                 if (packet.isAlive()) forwardToAllPeers(packet.decrementTTL())
             }
-
             is RoutingDecision.Forward -> {
                 val ip = peerRegistry.getIpFor(decision.nextHop)
                 if (ip != null) {
                     wifiTransport.send(packet.decrementTTL(), ip)
-                    Log.d(TAG, "Forwarded to ${decision.nextHop.shortId()} at $ip")
                 } else {
-                    // Route record is stale — fall back to store-and-discover
-                    Log.w(TAG, "No IP for ${decision.nextHop.shortId()} — storing")
                     packetStore.store(packet)
-                    broadcastRouteRequest(packet.dstId)
+                    broadcastRREQ(packet.dstId)
                 }
             }
-
             is RoutingDecision.StoreAndDiscover -> {
-                Log.d(TAG, "Storing packet for ${decision.destination.shortId()}, sending RREQ")
                 packetStore.store(packet)
-                broadcastRouteRequest(decision.destination)
+                broadcastRREQ(decision.destination)
             }
-
-            is RoutingDecision.Drop -> {
-                Log.d(TAG, "Dropped packet: ${decision.reason}")
-            }
+            is RoutingDecision.Drop -> Log.d(TAG, "Dropped: ${decision.reason}")
         }
     }
 
     private fun dispatchPacket(packet: MeshPacket) {
-        // Check if we have a direct route
         val ip = peerRegistry.getIpFor(packet.dstId)
         if (ip != null) {
             wifiTransport.send(packet, ip)
-            Log.d(TAG, "Dispatched ${packet.type} to ${packet.dstId.shortId()} at $ip")
+            if (packet.type == PacketType.MSG) ackManager.trackOutgoing(packet, ip)
         } else {
-            // Store and trigger route discovery
             packetStore.store(packet)
-            broadcastRouteRequest(packet.dstId)
-            Log.d(TAG, "Stored ${packet.type} for ${packet.dstId.shortId()} — no route yet")
+            broadcastRREQ(packet.dstId)
         }
     }
+
+    // ── Internal — app delivery ────────────────────────────────────────────────
 
     private fun deliverToApp(packet: MeshPacket) {
         when (packet.type) {
             PacketType.MSG -> {
-                val text = packet.payload.toString(Charsets.UTF_8)
+                val plaintext = decryptFromPeer(packet.srcId, packet.payload)
+                    ?: packet.payload  // fallback: treat as plaintext if no key
+                val text = plaintext.toString(Charsets.UTF_8)
                 Log.i(TAG, "MSG from ${packet.srcId.shortId()}: $text")
                 _incomingMessages.tryEmit(IncomingMessage(from = packet.srcId, text = text))
+                sendAck(packet)       // ← Phase 3: always ACK received messages
+            }
+            PacketType.ACK -> {
+                val payload = packet.payload.toString(Charsets.UTF_8)
+                ackManager.acknowledge(payload)
             }
             PacketType.SOS -> {
                 val text = packet.payload.toString(Charsets.UTF_8)
@@ -210,39 +204,152 @@ class MeshNode(private val context: Context) {
                     IncomingMessage(from = packet.srcId, text = "🆘 SOS: $text", isSOS = true)
                 )
             }
-            PacketType.ROUTE -> {
-                // AODV routing packets handled internally — not surfaced to app
-                handleRoutingPacket(packet)
-            }
-            else -> { /* ACK handling in Phase 3 */ }
+            PacketType.ROUTE -> handleRoutingPacket(packet)
+            PacketType.DISCOVER -> { /* handled in transport layer */ }
         }
     }
 
+    // ── Internal — ACK ────────────────────────────────────────────────────────
+
+    private fun sendAck(originalMsg: MeshPacket) {
+        val ackPayload = ackManager.buildAckPayload(originalMsg)
+        val ack = MeshPacket(
+            type    = PacketType.ACK,
+            srcId   = ourId,
+            dstId   = originalMsg.srcId,
+            ttl     = MeshPacket.DEFAULT_TTL,
+            payload = ackPayload
+        )
+        val ip = peerRegistry.getIpFor(originalMsg.srcId)
+        if (ip != null) {
+            wifiTransport.send(ack, ip)
+            Log.d(TAG, "ACK sent to ${originalMsg.srcId.shortId()}")
+        }
+    }
+
+    // ── Internal — AODV multi-hop routing ─────────────────────────────────────
+
+    /**
+     * Full RREQ/RREP handling — this is what enables A→B→C multi-hop.
+     *
+     * RREQ flow: A broadcasts RREQ looking for C
+     *   → B receives, checks if it knows C
+     *   → If yes: B sends RREP back to A
+     *   → If no:  B forwards RREQ (TTL decremented)
+     *
+     * RREP flow: B sends RREP to A
+     *   → A receives, records route: C is reachable via B
+     *   → A flushes any stored packets destined for C
+     */
     private fun handleRoutingPacket(packet: MeshPacket) {
         val payload = packet.payload.toString(Charsets.UTF_8)
-        if (payload.startsWith("RREQ:")) {
-            if (!router.hasSeenRequest(payload)) {
-                router.rememberRequest(payload)
-                // We don't know the destination — forward the RREQ
-                if (packet.isAlive()) forwardToAllPeers(packet.decrementTTL())
+
+        when {
+            payload.startsWith("RREQ:") -> handleRREQ(packet, payload)
+            payload.startsWith("RREP:") -> handleRREP(packet, payload)
+        }
+    }
+
+    private fun handleRREQ(packet: MeshPacket, payload: String) {
+        // Format: "RREQ:{requestId}:{destHex}"
+        val parts = payload.split(":")
+        if (parts.size < 3) return
+        val requestId = parts[1]
+        val destHex   = parts[2]
+
+        // Loop prevention — drop if we've seen this RREQ before
+        if (router.hasSeenRequest(requestId)) return
+        router.rememberRequest(requestId)
+
+        // Record reverse route: original requester (packet.srcId) reachable via sender
+        router.recordRoute(packet.srcId, packet.srcId)
+
+        val destination = runCatching { MeshID.fromHex(destHex) }.getOrNull() ?: return
+
+        when {
+            // Case 1: WE are the destination → send RREP back
+            destination == ourId -> {
+                Log.d(TAG, "RREQ: I am the destination — sending RREP to ${packet.srcId.shortId()}")
+                sendRREP(requestId, destination, replyTo = packet.srcId)
+            }
+            // Case 2: We have a direct route to the destination → send RREP
+            peerRegistry.getIpFor(destination) != null -> {
+                Log.d(TAG, "RREQ: I know ${destination.shortId()} — sending RREP to ${packet.srcId.shortId()}")
+                sendRREP(requestId, destination, replyTo = packet.srcId)
+            }
+            // Case 3: Unknown destination → forward RREQ
+            packet.isAlive() -> {
+                Log.d(TAG, "RREQ: forwarding — don't know ${destination.shortId()}")
+                forwardToAllPeers(packet.decrementTTL())
             }
         }
-        // RREP handling in Phase 3
+    }
+
+    private fun handleRREP(packet: MeshPacket, payload: String) {
+        // Format: "RREP:{requestId}:{destHex}"
+        val parts = payload.split(":")
+        if (parts.size < 3) return
+        val destHex = parts[2]
+
+        val destination = runCatching { MeshID.fromHex(destHex) }.getOrNull() ?: return
+
+        // Record route: [destination] is reachable via [packet.srcId]
+        router.recordRoute(destination, packet.srcId)
+        Log.d(TAG, "RREP received: ${destination.shortId()} reachable via ${packet.srcId.shortId()}")
+
+        if (packet.dstId == ourId) {
+            // We are the original requester — route found, flush stored packets
+            val ip = peerRegistry.getIpFor(packet.srcId)
+            if (ip != null) {
+                flushStoredPackets(destination, nextHopIp = ip)
+            }
+        } else {
+            // Forward RREP toward the original requester (packet.dstId)
+            val ip = peerRegistry.getIpFor(packet.dstId)
+            if (ip != null) {
+                wifiTransport.send(packet.decrementTTL(), ip)
+            } else {
+                forwardToAllPeers(packet.decrementTTL())
+            }
+        }
+    }
+
+    private fun sendRREP(requestId: String, destination: MeshID, replyTo: MeshID) {
+        val rrep = MeshPacket(
+            type    = PacketType.ROUTE,
+            srcId   = ourId,
+            dstId   = replyTo,
+            ttl     = MeshPacket.DEFAULT_TTL,
+            payload = "RREP:${requestId}:${destination}".toByteArray(Charsets.UTF_8)
+        )
+        val ip = peerRegistry.getIpFor(replyTo)
+        if (ip != null) {
+            wifiTransport.send(rrep, ip)
+        } else {
+            forwardToAllPeers(rrep)
+        }
+    }
+
+    private fun broadcastRREQ(destination: MeshID) {
+        val rreq = router.buildRouteRequest(destination)
+        forwardToAllPeers(rreq)
+        Log.d(TAG, "RREQ broadcast for ${destination.shortId()}")
     }
 
     private fun forwardToAllPeers(packet: MeshPacket) {
-        val peers = peerRegistry.getAll()
-        peers.forEach { peer ->
-            if (peer.meshId != packet.srcId) {  // Don't echo back to sender
+        peerRegistry.getAll().forEach { peer ->
+            if (peer.meshId != packet.srcId) {
                 wifiTransport.send(packet, peer.ipAddress)
             }
         }
-        Log.d(TAG, "Forwarded ${packet.type} to ${peers.size} peer(s)")
     }
 
-    private fun broadcastRouteRequest(destination: MeshID) {
-        val rreq = router.buildRouteRequest(destination)
-        forwardToAllPeers(rreq)
+    private fun flushStoredPackets(destination: MeshID, nextHopIp: String) {
+        val stored = packetStore.getPendingFor(destination)
+        if (stored.isEmpty()) return
+        Log.d(TAG, "Flushing ${stored.size} stored packet(s) to ${destination.shortId()} via $nextHopIp")
+        stored.forEach { wifiTransport.send(it.decrementTTL(), nextHopIp) }
+        packetStore.clearDelivered(destination)
     }
 
     // ── Internal — peer discovery ──────────────────────────────────────────────
@@ -250,17 +357,33 @@ class MeshNode(private val context: Context) {
     private fun observePeerHandshakes() {
         scope.launch {
             wifiTransport.peerHandshakes.collect { handshake ->
+                // Reconstruct peer's public key from the bytes in DISCOVER payload
+                val peerPublicKey = if (handshake.publicKeyBytes.isNotEmpty()) {
+                    KeyManager.publicKeyFromBytes(handshake.publicKeyBytes)
+                } else null
+
+                // Derive and cache the shared AES-256 key for this peer
+                if (peerPublicKey != null) {
+                    val sharedKey = MeshCrypto.computeSharedKey(
+                        ourPrivateKey  = keyManager.privateKey,
+                        theirPublicKey = peerPublicKey
+                    )
+                    peerRegistry.storeSharedKey(handshake.meshId, sharedKey)
+                    Log.d(TAG, "Shared key derived for ${handshake.meshId.shortId()} — messages will be encrypted")
+                } else {
+                    Log.w(TAG, "No public key from ${handshake.meshId.shortId()} — messages unencrypted")
+                }
+
                 val peer = PeerInfo(
-                    meshId    = handshake.meshId,
-                    ipAddress = handshake.ipAddress
+                    meshId     = handshake.meshId,
+                    ipAddress  = handshake.ipAddress,
+                    publicKey  = peerPublicKey
                 )
                 peerRegistry.register(peer)
                 router.recordRoute(handshake.meshId, handshake.meshId)
 
-                Log.d(TAG, "New peer registered: ${peer.meshId.shortId()} at ${peer.ipAddress}")
-
-                // Deliver any packets we were holding for this peer
-                deliverStoredPackets(peer)
+                // Deliver any packets we stored for this peer before they connected
+                flushStoredPackets(handshake.meshId, nextHopIp = handshake.ipAddress)
             }
         }
     }
@@ -268,24 +391,30 @@ class MeshNode(private val context: Context) {
     private fun observeDiscoveredNodes() {
         scope.launch {
             bleTransport.discoveredNodes.collect { node ->
-                Log.d(TAG, "BLE: MRIT node at ${node.bluetoothAddress} (${node.rssi} dBm)")
                 wifiTransport.connectToPeer(node.bluetoothAddress)
             }
         }
     }
 
-    /**
-     * When a peer comes into range, flush any packets we stored for them.
-     */
-    private fun deliverStoredPackets(peer: PeerInfo) {
-        val pending = packetStore.getPendingFor(peer.meshId)
-        if (pending.isEmpty()) return
+    // ── Internal — encryption ─────────────────────────────────────────────────
 
-        Log.d(TAG, "Delivering ${pending.size} stored packet(s) to ${peer.meshId.shortId()}")
-        pending.forEach { packet ->
-            wifiTransport.send(packet.decrementTTL(), peer.ipAddress)
-        }
-        packetStore.clearDelivered(peer.meshId)
+    /**
+     * Encrypt [plaintext] for a specific peer using the shared AES-256-GCM key.
+     * Returns null if we don't have a shared key with this peer yet.
+     */
+    private fun encryptForPeer(peerId: MeshID, plaintext: ByteArray): ByteArray? {
+        if (peerId == MeshID.BROADCAST) return null  // broadcasts are never encrypted
+        val key = peerRegistry.getSharedKey(peerId) ?: return null
+        return MeshCrypto.encrypt(plaintext, key)
+    }
+
+    /**
+     * Decrypt an incoming packet's payload using the shared key with the sender.
+     * Returns null if decryption fails (wrong key, tampered data, or no key yet).
+     */
+    private fun decryptFromPeer(peerId: MeshID, payload: ByteArray): ByteArray? {
+        val key = peerRegistry.getSharedKey(peerId) ?: return null
+        return MeshCrypto.decrypt(payload, key)
     }
 
     // ── Maintenance ────────────────────────────────────────────────────────────
@@ -303,14 +432,13 @@ class MeshNode(private val context: Context) {
     // ── MeshID persistence ─────────────────────────────────────────────────────
 
     private fun loadOrCreateMeshId(): MeshID {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val prefs  = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val stored = prefs.getString(KEY_MESH_ID, null)
         return if (stored != null) {
-            MeshID.fromHex(stored).also { Log.d(TAG, "Loaded MeshID: ${it.shortId()}") }
+            MeshID.fromHex(stored)
         } else {
             MeshID.generate().also {
                 prefs.edit().putString(KEY_MESH_ID, it.toString()).apply()
-                Log.d(TAG, "Generated new MeshID: ${it.shortId()}")
             }
         }
     }

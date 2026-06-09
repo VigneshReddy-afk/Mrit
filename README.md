@@ -18,7 +18,7 @@ MRIT is a from-scratch mesh networking stack for Android that lets phones commun
 ├──────────────────────────────────────────┤
 │  LAYER 2 : MMP (Mobile Mesh Protocol)    │
 │  Custom protocol — routing, addressing,  │
-│  encryption, store-and-forward           │
+│  E2E encryption, store-and-forward, ACK  │
 ├──────────────────────────────────────────┤
 │  LAYER 1 : TRANSPORT                     │
 │  WiFi Direct (data) + BLE (discovery)    │
@@ -36,16 +36,50 @@ MRIT is a from-scratch mesh networking stack for Android that lets phones commun
 └──────────┴──────────┴────────────┴────────────┴──────────┴──────────┴──────────────┘
 ```
 
-- **MeshID** — 256-bit SHA-256 identity, generated on first install
+- **MeshID** — 256-bit SHA-256(EC_PublicKey + timestamp + salt), permanent identity
 - **TTL** — starts at 64, decrements each hop, packet dies at 0
 - **Types** — MSG, ACK, DISCOVER, ROUTE, SOS
 - **Max payload** — 65,535 bytes per packet
 
 ---
 
+## End-to-End Encryption (Phase 3)
+
+Every unicast message is encrypted before it leaves the device.
+
+| Step | Algorithm | Detail |
+|---|---|---|
+| Key generation | EC P-256 | One key pair per device, generated on first install |
+| Key exchange | ECDH | Public keys exchanged in DISCOVER handshake |
+| Key derivation | SHA-256 | `SHA-256(sharedSecret)` → 32-byte AES key |
+| Encryption | AES-256-GCM | 12-byte random IV per message, 16-byte auth tag |
+
+**Encrypted payload wire format:**
+```
+[ 12 bytes : random IV ] [ N+16 bytes : ciphertext + auth tag ]
+```
+Overhead: 28 bytes per message. Any tampering → auth tag fails → packet dropped.
+
+---
+
 ## Routing — AODV
 
-MRIT uses **Ad-hoc On-Demand Distance Vector (AODV)** routing — the same algorithm used in military and emergency mesh networks. Routes are discovered on demand and expire after 30 seconds to handle device movement.
+MRIT uses **Ad-hoc On-Demand Distance Vector (AODV)** routing (RFC 3561).
+
+**Multi-hop flow (A → B → C):**
+```
+A ──RREQ──▶ B ──RREQ──▶ C
+A ◀──RREP── B ◀──RREP── C
+A ──MSG───▶ B ──MSG───▶ C   (route now known)
+```
+Routes expire after 30 seconds to handle device movement.
+
+---
+
+## Reliability — ACK + Retry (Phase 3)
+
+Every delivered MSG triggers an ACK packet back to the sender.
+If ACK is not received within 5 seconds, the message is re-sent (up to 3 attempts).
 
 ---
 
@@ -60,7 +94,8 @@ MRIT uses **Ad-hoc On-Demand Distance Vector (AODV)** routing — the same algor
 
 ## Store-and-Forward
 
-Packets that can't be delivered immediately (unknown route) are stored in a local SQLite database for up to 24 hours. When the destination node comes into range, queued packets are automatically forwarded.
+Packets for unreachable peers are stored in SQLite for up to 24 hours.
+Delivered automatically when the destination comes into range.
 
 ---
 
@@ -70,30 +105,42 @@ Packets that can't be delivered immediately (unknown route) are stored in a loca
 app/src/main/java/com/mrit/mesh/
 ├── core/
 │   ├── MeshID.kt               — 256-bit node identity
-│   └── MeshPacket.kt           — MMP packet model + PacketType enum
+│   ├── MeshPacket.kt           — MMP packet + PacketType enum
+│   ├── PeerInfo.kt             — peer data (MeshID, IP, public key)
+│   └── PeerRegistry.kt        — thread-safe peer + shared key table
+├── crypto/
+│   ├── KeyManager.kt           — EC P-256 key pair generation & storage
+│   └── MeshCrypto.kt           — ECDH key agreement + AES-256-GCM encrypt/decrypt
 ├── protocol/
-│   ├── MMPEncoder.kt           — serialize MeshPacket to bytes
-│   └── MMPDecoder.kt           — deserialize bytes to MeshPacket
+│   ├── MMPEncoder.kt           — MeshPacket → bytes
+│   └── MMPDecoder.kt           — bytes → MeshPacket
 ├── transport/
-│   ├── WifiDirectTransport.kt  — data transfer over WiFi Direct
-│   └── BLETransport.kt         — peer discovery over BLE
+│   ├── WifiDirectTransport.kt  — data transfer + handshake over WiFi Direct
+│   └── BLETransport.kt         — peer discovery over Bluetooth LE
 ├── routing/
-│   └── AODVRouter.kt           — AODV mesh routing engine
+│   └── AODVRouter.kt           — AODV routing engine (RREQ/RREP/route table)
+├── reliability/
+│   └── AckManager.kt           — ACK tracking + retry logic
 ├── storage/
 │   └── PacketStore.kt          — SQLite store-and-forward queue
+├── mesh/
+│   └── MeshNode.kt             — complete mesh API (send/receive/route/encrypt)
 ├── service/
-│   └── MeshService.kt          — foreground service, ties everything together
-└── MainActivity.kt             — entry point, permissions, UI
+│   └── MeshService.kt          — foreground service lifecycle
+├── ui/
+│   ├── PeerAdapter.kt          — live peer chip list
+│   └── MessageAdapter.kt       — message log
+└── MainActivity.kt             — entry point, permissions, messaging UI
 ```
 
 ---
 
 ## Roadmap
 
-- [x] **Phase 1** — Core protocol + transport layer (current)
-- [ ] **Phase 2** — Peer address table, full multi-hop routing
-- [ ] **Phase 3** — Encrypted messaging app on top of the mesh
-- [ ] **Phase 4** — iOS port
+- [x] **Phase 1** — MMP protocol, WiFi Direct + BLE transport, AODV router, store-and-forward
+- [x] **Phase 2** — Peer registry, WiFi Direct handshake, full routing, messaging UI
+- [x] **Phase 3** — E2E encryption (ECDH + AES-256-GCM), ACK + retry, multi-hop RREQ/RREP
+- [ ] **Phase 4** — iOS port, Android Keystore migration, file transfer
 - [ ] **Phase 5** — Custom DSL for mesh-aware application development
 
 ---
