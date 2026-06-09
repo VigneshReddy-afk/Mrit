@@ -79,11 +79,12 @@ data class MeshPacket(
  * All packet types supported by MMP v0.1
  */
 enum class PacketType(val byte: Byte) {
-    MSG(0x01),       // User message — text, file chunk, or binary blob
-    ACK(0x02),       // Delivery acknowledgement
-    DISCOVER(0x03),  // Node discovery broadcast — "who is nearby?"
-    ROUTE(0x04),     // AODV routing control (RREQ / RREP)
-    SOS(0x05);       // Emergency broadcast — highest priority, max TTL, no drop
+    MSG(0x01),        // User text message
+    ACK(0x02),        // Delivery acknowledgement
+    DISCOVER(0x03),   // Node discovery / handshake
+    ROUTE(0x04),      // AODV routing control (RREQ / RREP)
+    SOS(0x05),        // Emergency broadcast — highest priority, max TTL, no drop
+    FILE_CHUNK(0x06); // File transfer chunk — reassembled by FileTransferManager
 
     companion object {
         fun fromByte(b: Byte): PacketType =

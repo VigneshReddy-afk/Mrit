@@ -11,6 +11,7 @@ import com.mrit.mesh.crypto.KeyManager
 import com.mrit.mesh.crypto.MeshCrypto
 import com.mrit.mesh.reliability.AckManager
 import com.mrit.mesh.routing.AODVRouter
+import com.mrit.mesh.transfer.FileTransferManager
 import com.mrit.mesh.routing.RoutingDecision
 import com.mrit.mesh.storage.PacketStore
 import com.mrit.mesh.transport.BLETransport
@@ -21,19 +22,24 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * MeshNode — the complete MRIT mesh stack. Phase 3.
+ * MeshNode — the complete MRIT mesh stack. Phase 4.
  *
- * New in Phase 3:
- *   - End-to-end encryption  : every unicast MSG is AES-256-GCM encrypted with
- *                              a per-peer key derived via ECDH during handshake
- *   - Delivery reliability   : AckManager sends ACK on receipt; retries 3× on timeout
- *   - Complete multi-hop     : full AODV RREQ/RREP — A can reach C through B
+ * New in Phase 4:
+ *   - File transfer          : sendFile() splits any file into 32KB AES-GCM–encrypted
+ *                              chunks; FileTransferManager reassembles in any arrival order
+ *   - Hardware key storage   : EC P-256 private key now wrapped by EncryptedSharedPreferences
+ *                              (Android Keystore AES-256-GCM master key — hardware-backed on
+ *                              Secure Enclave devices)
+ *   - iOS counterpart        : Swift Package at ios/ with binary-compatible MMP codec,
+ *                              CryptoKit-based crypto, MultipeerConnectivity transport
  *
- * Public API (unchanged from Phase 2):
- *   node.sendMessage(to, text)     — unicast encrypted message
- *   node.sendSOS(text)             — broadcast unencrypted emergency
- *   node.incomingMessages          — Flow of received messages
- *   node.peers                     — StateFlow of connected peers
+ * Public API:
+ *   node.sendMessage(to, text)              — unicast encrypted message
+ *   node.sendFile(to, fileName, data)       — encrypted file transfer (any size)
+ *   node.sendSOS(text)                      — broadcast unencrypted emergency
+ *   node.incomingMessages                   — Flow<IncomingMessage>
+ *   node.incomingFiles                      — Flow<ReceivedFile>
+ *   node.peers                              — StateFlow<List<PeerInfo>>
  */
 class MeshNode(private val context: Context) {
 
@@ -59,6 +65,15 @@ class MeshNode(private val context: Context) {
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    private val fileTransferManager = FileTransferManager(
+        ourId       = ourId,
+        sendPacket  = { packet, dest -> dispatchPacket(packet) },
+        onFileReceived = { fileName, data ->
+            Log.i(TAG, "File received: '$fileName' (${data.size} bytes)")
+            _incomingFiles.tryEmit(ReceivedFile(fileName = fileName, data = data))
+        }
+    )
+
     private val ackManager = AckManager(
         scope            = scope,
         onRetry          = { packet, ip -> wifiTransport.send(packet, ip) },
@@ -76,6 +91,11 @@ class MeshNode(private val context: Context) {
 
     private val _incomingMessages = MutableSharedFlow<IncomingMessage>(extraBufferCapacity = 64)
     val incomingMessages: SharedFlow<IncomingMessage> = _incomingMessages
+
+    /** Emits every completed file received from any peer */
+    private val _incomingFiles = MutableSharedFlow<ReceivedFile>(extraBufferCapacity = 16)
+    val incomingFiles: SharedFlow<ReceivedFile> = _incomingFiles
+
     val peers: StateFlow<List<PeerInfo>> = peerRegistry.peers
 
     // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -116,6 +136,18 @@ class MeshNode(private val context: Context) {
             payload = payload
         )
         dispatchPacket(packet)
+    }
+
+    /**
+     * Send a file to [to] — split into 32KB encrypted chunks.
+     * Chunks arrive in any order and are reassembled automatically on the receiver.
+     *
+     * @param to       Destination MeshID
+     * @param fileName Original filename (e.g. "photo.jpg")
+     * @param data     Raw file bytes
+     */
+    fun sendFile(to: MeshID, fileName: String, data: ByteArray) {
+        fileTransferManager.send(dest = to, fileName = fileName, data = data)
     }
 
     /**
@@ -206,6 +238,12 @@ class MeshNode(private val context: Context) {
             }
             PacketType.ROUTE -> handleRoutingPacket(packet)
             PacketType.DISCOVER -> { /* handled in transport layer */ }
+            PacketType.FILE_CHUNK -> {
+                // Decrypt the chunk payload (fallback to raw if no shared key yet)
+                val plaintext = decryptFromPeer(packet.srcId, packet.payload)
+                    ?: packet.payload
+                fileTransferManager.onChunkReceived(packet.srcId, plaintext)
+            }
         }
     }
 
@@ -451,4 +489,29 @@ class MeshNode(private val context: Context) {
         val isSOS: Boolean = false,
         val timestampMs: Long = System.currentTimeMillis()
     )
+
+    /**
+     * Emitted on [incomingFiles] when all chunks of a file transfer have arrived
+     * and been reassembled into the original file bytes.
+     */
+    data class ReceivedFile(
+        val fileName: String,
+        val data: ByteArray,
+        val timestampMs: Long = System.currentTimeMillis()
+    ) {
+        // ByteArray equality must be content-based, not reference-based
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is ReceivedFile) return false
+            return fileName    == other.fileName
+                && timestampMs == other.timestampMs
+                && data.contentEquals(other.data)
+        }
+        override fun hashCode(): Int {
+            var result = fileName.hashCode()
+            result = 31 * result + data.contentHashCode()
+            result = 31 * result + timestampMs.hashCode()
+            return result
+        }
+    }
 }

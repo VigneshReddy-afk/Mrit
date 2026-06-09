@@ -38,8 +38,28 @@ MRIT is a from-scratch mesh networking stack for Android that lets phones commun
 
 - **MeshID** — 256-bit SHA-256(EC_PublicKey + timestamp + salt), permanent identity
 - **TTL** — starts at 64, decrements each hop, packet dies at 0
-- **Types** — MSG, ACK, DISCOVER, ROUTE, SOS
+- **Types** — MSG(0x01), ACK(0x02), DISCOVER(0x03), ROUTE(0x04), SOS(0x05), FILE_CHUNK(0x06)
 - **Max payload** — 65,535 bytes per packet
+
+---
+
+## File Transfer (Phase 4)
+
+Files of any size are transferred peer-to-peer over the mesh.
+
+```
+sender.sendFile(destId, "photo.jpg", bytes)
+```
+
+| Step | Detail |
+|---|---|
+| Split | File divided into 32 KB chunks |
+| Header | 30-byte binary header: transferId(16) + chunkIndex(4) + totalChunks(4) + size(4) + nameLen(2) + name |
+| Encrypt | Each chunk AES-256-GCM encrypted with the per-peer shared key |
+| Reassemble | Chunks may arrive in any order; FileTransferManager reconstructs in index order |
+| Deliver | `incomingFiles: SharedFlow<ReceivedFile>` emits the complete file |
+
+Chunk format is binary-compatible between Android and iOS.
 
 ---
 
@@ -105,32 +125,51 @@ Delivered automatically when the destination comes into range.
 app/src/main/java/com/mrit/mesh/
 ├── core/
 │   ├── MeshID.kt               — 256-bit node identity
-│   ├── MeshPacket.kt           — MMP packet + PacketType enum
+│   ├── MeshPacket.kt           — MMP packet + PacketType enum (MSG/ACK/DISCOVER/ROUTE/SOS/FILE_CHUNK)
 │   ├── PeerInfo.kt             — peer data (MeshID, IP, public key)
 │   └── PeerRegistry.kt        — thread-safe peer + shared key table
 ├── crypto/
-│   ├── KeyManager.kt           — EC P-256 key pair generation & storage
+│   ├── KeyManager.kt           — EC P-256 key pair — EncryptedSharedPreferences (Phase 4)
 │   └── MeshCrypto.kt           — ECDH key agreement + AES-256-GCM encrypt/decrypt
 ├── protocol/
-│   ├── MMPEncoder.kt           — MeshPacket → bytes
-│   └── MMPDecoder.kt           — bytes → MeshPacket
+│   ├── MMPEncoder.kt           — MeshPacket → bytes (big-endian)
+│   └── MMPDecoder.kt           — bytes → MeshPacket (null-safe)
 ├── transport/
-│   ├── WifiDirectTransport.kt  — data transfer + handshake over WiFi Direct
+│   ├── WifiDirectTransport.kt  — data transfer + DISCOVER handshake over WiFi Direct
 │   └── BLETransport.kt         — peer discovery over Bluetooth LE
 ├── routing/
 │   └── AODVRouter.kt           — AODV routing engine (RREQ/RREP/route table)
 ├── reliability/
-│   └── AckManager.kt           — ACK tracking + retry logic
+│   └── AckManager.kt           — ACK tracking + 3-retry logic
 ├── storage/
-│   └── PacketStore.kt          — SQLite store-and-forward queue
+│   └── PacketStore.kt          — SQLite store-and-forward queue (24h TTL)
+├── transfer/
+│   └── FileTransferManager.kt  — 32KB chunked file send/reassemble (Phase 4)
 ├── mesh/
-│   └── MeshNode.kt             — complete mesh API (send/receive/route/encrypt)
+│   └── MeshNode.kt             — complete mesh API: sendMessage/sendFile/sendSOS
 ├── service/
 │   └── MeshService.kt          — foreground service lifecycle
 ├── ui/
 │   ├── PeerAdapter.kt          — live peer chip list
 │   └── MessageAdapter.kt       — message log
 └── MainActivity.kt             — entry point, permissions, messaging UI
+
+ios/                            — Swift Package (Phase 4)
+├── Package.swift               — SPM manifest, iOS 14+
+└── Sources/MritMesh/
+    ├── Core/
+    │   ├── MeshID.swift        — 256-bit identity, CryptoKit P256
+    │   └── MeshPacket.swift    — MMP struct, binary-compatible with Android
+    ├── Protocol/
+    │   └── MMPCodec.swift      — encode/decode, big-endian, identical wire format
+    ├── Crypto/
+    │   ├── KeyManager.swift    — iOS Keychain (SecItem) key persistence
+    │   └── MeshCrypto.swift    — CryptoKit ECDH + AES.GCM, same derivation as Android
+    ├── Transport/
+    │   └── MultipeerTransport.swift — MultipeerConnectivity, service "mrit-mesh"
+    └── Mesh/
+        ├── MeshNode.swift      — iOS public API (sendMessage/sendFile/sendSOS)
+        └── FileTransferManager.swift — chunked file transfer, binary-compatible payloads
 ```
 
 ---
@@ -140,8 +179,8 @@ app/src/main/java/com/mrit/mesh/
 - [x] **Phase 1** — MMP protocol, WiFi Direct + BLE transport, AODV router, store-and-forward
 - [x] **Phase 2** — Peer registry, WiFi Direct handshake, full routing, messaging UI
 - [x] **Phase 3** — E2E encryption (ECDH + AES-256-GCM), ACK + retry, multi-hop RREQ/RREP
-- [ ] **Phase 4** — iOS port, Android Keystore migration, file transfer
-- [ ] **Phase 5** — Custom DSL for mesh-aware application development
+- [x] **Phase 4** — iOS Swift Package (9 files, binary-compatible), Android Keystore key storage, encrypted 32KB chunked file transfer, 11-test crypto suite
+- [ ] **Phase 5** — Cross-platform DSL for mesh-aware application development
 
 ---
 
