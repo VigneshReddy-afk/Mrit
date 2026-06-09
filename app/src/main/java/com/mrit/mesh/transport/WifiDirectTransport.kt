@@ -7,7 +7,9 @@ import android.content.IntentFilter
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pManager
 import android.util.Log
+import com.mrit.mesh.core.MeshID
 import com.mrit.mesh.core.MeshPacket
+import com.mrit.mesh.core.PacketType
 import com.mrit.mesh.protocol.MMPDecoder
 import com.mrit.mesh.protocol.MMPEncoder
 import kotlinx.coroutines.*
@@ -22,21 +24,25 @@ import java.net.Socket
 /**
  * WifiDirectTransport — sends and receives MeshPackets over WiFi Direct (P2P).
  *
- * Role: Bulk data transfer (fast, ~200 m range per hop, ~250 Mbps)
- * Discovery is handled by BLETransport (always-on, low-power).
+ * Phase 2 additions:
+ *   - Accepts [ourId] to build DISCOVER (handshake) packets
+ *   - Performs MeshID handshake immediately after WiFi Direct connects
+ *   - Emits [peerHandshakes] when a new peer's MeshID + IP is learned
+ *   - Emits [incomingPackets] for all non-handshake data packets
  *
- * Architecture:
- *   Group Owner → ServerSocket on PORT 8988, accepts incoming connections
- *   Client      → connects to group owner IP via Socket
- *
- * Data framing over TCP:
- *   [4 bytes: packet length as Int] [N bytes: MMP encoded packet]
+ * Handshake flow (both sides use the same port 8988):
+ *   Client → Server : DISCOVER packet  (srcId = client MeshID, payload = empty)
+ *   Server → Client : DISCOVER packet  (srcId = server MeshID, payload = empty)
+ *   Each side records the other's MeshID ↔ IP mapping in PeerRegistry.
  */
-class WifiDirectTransport(private val context: Context) {
+class WifiDirectTransport(
+    private val context: Context,
+    private val ourId: MeshID          // ← Phase 2: needed for handshake packets
+) {
 
     companion object {
-        private const val TAG  = "WiFiDirectTransport"
-        private const val PORT = 8988
+        private const val TAG              = "WiFiDirectTransport"
+        private const val PORT             = 8988
         private const val SOCKET_TIMEOUT_MS = 10_000
     }
 
@@ -49,18 +55,26 @@ class WifiDirectTransport(private val context: Context) {
     private var serverSocket: ServerSocket? = null
     private var isRunning = false
 
-    /** All incoming MeshPackets are emitted here for the router to process */
+    /** Emits decoded data packets (non-handshake) for the router */
     private val _incomingPackets = MutableSharedFlow<MeshPacket>(extraBufferCapacity = 128)
     val incomingPackets: SharedFlow<MeshPacket> = _incomingPackets
 
-    /** WiFi P2P broadcast receiver — listens for state and connection changes */
+    /**
+     * Emits a [PeerHandshake] each time we learn a new peer's MeshID ↔ IP mapping.
+     * MeshService observes this and registers the peer in PeerRegistry.
+     */
+    private val _peerHandshakes = MutableSharedFlow<PeerHandshake>(extraBufferCapacity = 32)
+    val peerHandshakes: SharedFlow<PeerHandshake> = _peerHandshakes
+
+    // ── WiFi P2P broadcast receiver ────────────────────────────────────────────
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             when (intent.action) {
                 WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
                     val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
                     if (state != WifiP2pManager.WIFI_P2P_STATE_ENABLED) {
-                        Log.w(TAG, "WiFi Direct is disabled on this device")
+                        Log.w(TAG, "WiFi Direct disabled")
                     }
                 }
                 WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
@@ -69,29 +83,29 @@ class WifiDirectTransport(private val context: Context) {
                         WifiP2pManager.EXTRA_NETWORK_INFO
                     )
                     if (netInfo?.isConnected == true) {
-                        // Connection established — find out if we are group owner or client
                         manager.requestConnectionInfo(channel, connectionInfoListener)
+                    } else {
+                        Log.d(TAG, "WiFi Direct disconnected")
                     }
                 }
             }
         }
     }
 
-    /** Handles result of WifiP2pManager.requestConnectionInfo() */
     private val connectionInfoListener = WifiP2pManager.ConnectionInfoListener { info ->
         if (!info.groupFormed) return@ConnectionInfoListener
 
         if (info.isGroupOwner) {
-            Log.d(TAG, "We are the group owner — starting server socket")
+            Log.d(TAG, "We are group owner — server socket started")
             startServer()
         } else {
-            val ownerAddress = info.groupOwnerAddress?.hostAddress ?: return@ConnectionInfoListener
-            Log.d(TAG, "We are a client — group owner is at $ownerAddress")
-            // Address stored by MeshNode for outgoing sends
+            val ownerIp = info.groupOwnerAddress?.hostAddress ?: return@ConnectionInfoListener
+            Log.d(TAG, "We are client — group owner IP: $ownerIp")
+            performHandshakeAsClient(ownerIp)
         }
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    // ── Lifecycle ──────────────────────────────────────────────────────────────
 
     fun start() {
         channel = manager.initialize(context, context.mainLooper, null)
@@ -104,9 +118,8 @@ class WifiDirectTransport(private val context: Context) {
             addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
         }
         context.registerReceiver(receiver, filter)
-
         discoverPeers()
-        Log.d(TAG, "WifiDirectTransport started")
+        Log.d(TAG, "WifiDirectTransport started (ourId=${ourId.shortId()})")
     }
 
     fun stop() {
@@ -117,7 +130,7 @@ class WifiDirectTransport(private val context: Context) {
         Log.d(TAG, "WifiDirectTransport stopped")
     }
 
-    // ── Peer discovery ─────────────────────────────────────────────────────────
+    // ── Peer discovery & connection ────────────────────────────────────────────
 
     private fun discoverPeers() {
         manager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
@@ -134,36 +147,89 @@ class WifiDirectTransport(private val context: Context) {
         })
     }
 
-    // ── Data transfer ──────────────────────────────────────────────────────────
+    // ── Handshake ──────────────────────────────────────────────────────────────
 
     /**
-     * Send a MeshPacket to a peer by their IP address.
-     * Called by the router after a route is known.
+     * CLIENT-SIDE handshake.
+     * Sends our DISCOVER packet → receives owner's DISCOVER → emits PeerHandshake.
      */
-    fun send(packet: MeshPacket, peerIpAddress: String) {
+    private fun performHandshakeAsClient(ownerIp: String) {
         scope.launch {
             try {
                 Socket().use { socket ->
-                    socket.connect(InetSocketAddress(peerIpAddress, PORT), SOCKET_TIMEOUT_MS)
-                    val out = DataOutputStream(socket.getOutputStream())
-                    val encoded = MMPEncoder.encode(packet)
-                    out.writeInt(encoded.size)   // 4-byte length prefix
-                    out.write(encoded)
-                    out.flush()
-                    Log.d(TAG, "Sent ${encoded.size} bytes to $peerIpAddress (${packet.type})")
+                    socket.connect(InetSocketAddress(ownerIp, PORT), SOCKET_TIMEOUT_MS)
+                    val out   = DataOutputStream(socket.getOutputStream())
+                    val input = DataInputStream(socket.getInputStream())
+
+                    // 1. Send our DISCOVER
+                    sendDiscover(out)
+
+                    // 2. Receive owner's DISCOVER
+                    val packet = readPacket(input)
+                    if (packet?.type == PacketType.DISCOVER) {
+                        val handshake = PeerHandshake(meshId = packet.srcId, ipAddress = ownerIp)
+                        _peerHandshakes.emit(handshake)
+                        Log.d(TAG, "Handshake complete — owner is ${packet.srcId.shortId()} at $ownerIp")
+                    }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Send to $peerIpAddress failed: ${e.message}")
+                Log.e(TAG, "Client handshake failed: ${e.message}")
             }
         }
     }
 
-    /** Start the server socket — only called when this device is group owner */
+    /**
+     * SERVER-SIDE handshake — called from [handleIncomingConnection] when the
+     * first packet from a new client is a DISCOVER.
+     */
+    private suspend fun performHandshakeAsServer(
+        socket: Socket,
+        clientDiscover: MeshPacket
+    ) {
+        try {
+            val clientIp = socket.inetAddress.hostAddress ?: return
+            val out = DataOutputStream(socket.getOutputStream())
+
+            // 1. Send our DISCOVER back
+            sendDiscover(out)
+
+            // 2. Record the peer
+            val handshake = PeerHandshake(meshId = clientDiscover.srcId, ipAddress = clientIp)
+            _peerHandshakes.emit(handshake)
+            Log.d(TAG, "Handshake complete — client is ${clientDiscover.srcId.shortId()} at $clientIp")
+        } catch (e: Exception) {
+            Log.e(TAG, "Server handshake failed: ${e.message}")
+        }
+    }
+
+    // ── Data transfer ──────────────────────────────────────────────────────────
+
+    /**
+     * Send a [MeshPacket] to a peer at [peerIp].
+     * Opens a fresh TCP connection, writes the packet, closes.
+     */
+    fun send(packet: MeshPacket, peerIp: String) {
+        scope.launch {
+            try {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(peerIp, PORT), SOCKET_TIMEOUT_MS)
+                    val out = DataOutputStream(socket.getOutputStream())
+                    writePacket(out, packet)
+                    Log.d(TAG, "Sent ${packet.type} to $peerIp (TTL=${packet.ttl})")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Send to $peerIp failed: ${e.message}")
+            }
+        }
+    }
+
+    // ── Server socket ──────────────────────────────────────────────────────────
+
     private fun startServer() {
         scope.launch {
             try {
                 serverSocket = ServerSocket(PORT)
-                Log.d(TAG, "Server socket listening on port $PORT")
+                Log.d(TAG, "Listening on :$PORT")
                 while (isRunning) {
                     val client = serverSocket?.accept() ?: break
                     launch { handleIncomingConnection(client) }
@@ -174,32 +240,67 @@ class WifiDirectTransport(private val context: Context) {
         }
     }
 
-    /** Read one MeshPacket from an incoming socket connection */
     private suspend fun handleIncomingConnection(socket: Socket) {
         try {
-            socket.use {
-                val input = DataInputStream(socket.getInputStream())
-                val length = input.readInt()
+            // Deliberately NOT using `socket.use{}` here — handshake needs to write back
+            val input  = DataInputStream(socket.getInputStream())
+            val packet = readPacket(input)
 
-                // Sanity check — reject absurdly large declared sizes
-                if (length <= 0 || length > MeshPacket.HEADER_SIZE + MeshPacket.MAX_PAYLOAD_SIZE) {
-                    Log.w(TAG, "Rejected packet with invalid declared length: $length")
-                    return
-                }
-
-                val data = ByteArray(length)
-                input.readFully(data)
-
-                val packet = MMPDecoder.decode(data)
-                if (packet != null) {
-                    Log.d(TAG, "Received $packet")
-                    _incomingPackets.emit(packet)
-                } else {
-                    Log.w(TAG, "Received malformed packet from ${socket.inetAddress.hostAddress} — dropped")
-                }
+            if (packet == null) {
+                socket.close()
+                return
             }
+
+            if (packet.type == PacketType.DISCOVER) {
+                // Handshake — respond and register peer (server side)
+                performHandshakeAsServer(socket, packet)
+            } else {
+                // Regular data packet — route it
+                Log.d(TAG, "Received $packet")
+                _incomingPackets.emit(packet)
+            }
+
+            socket.close()
         } catch (e: Exception) {
-            Log.e(TAG, "Error reading from client: ${e.message}")
+            Log.e(TAG, "Error handling connection: ${e.message}")
+            runCatching { socket.close() }
         }
     }
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    private fun buildDiscoverPacket(): MeshPacket = MeshPacket(
+        type    = PacketType.DISCOVER,
+        srcId   = ourId,
+        dstId   = MeshID.BROADCAST,
+        ttl     = 1,                  // Handshake never hops — TTL=1
+        payload = ByteArray(0)
+    )
+
+    private fun sendDiscover(out: DataOutputStream) = writePacket(out, buildDiscoverPacket())
+
+    private fun writePacket(out: DataOutputStream, packet: MeshPacket) {
+        val encoded = MMPEncoder.encode(packet)
+        out.writeInt(encoded.size)
+        out.write(encoded)
+        out.flush()
+    }
+
+    private fun readPacket(input: DataInputStream): MeshPacket? {
+        val length = input.readInt()
+        if (length <= 0 || length > MeshPacket.HEADER_SIZE + MeshPacket.MAX_PAYLOAD_SIZE) return null
+        val data = ByteArray(length)
+        input.readFully(data)
+        return MMPDecoder.decode(data)
+    }
+
+    // ── Data model ────────────────────────────────────────────────────────────
+
+    /**
+     * Result of a completed handshake — we now know this peer's MeshID and IP.
+     */
+    data class PeerHandshake(
+        val meshId: MeshID,
+        val ipAddress: String
+    )
 }
