@@ -105,18 +105,26 @@ class AODVRouter(private val ourId: MeshID) {
 
     /**
      * Build a Route Request packet — broadcast to discover the path to [destination].
-     * The request ID is stored to prevent echoing it back if we hear our own RREQ.
+     *
+     * Payload format (per PROTOCOL.md): "RREQ:{requestId}:{destinationFullHex}"
+     *   - requestId          : random 8 hex chars — uniquely identifies this RREQ
+     *                          for loop prevention via [hasSeenRequest]/[rememberRequest]
+     *   - destinationFullHex : full 64-char hex MeshID (NOT the 8-char shortId —
+     *                          MeshID.fromHex() requires exactly 64 chars)
+     *
+     * The request ID is remembered immediately so we never re-process our own RREQ
+     * if it loops back to us.
      */
     fun buildRouteRequest(destination: MeshID): MeshPacket {
-        val rreqId = "RREQ:${ourId.shortId()}:${destination.shortId()}:${System.currentTimeMillis()}"
-        rememberRequest(rreqId)
+        val requestId = java.util.UUID.randomUUID().toString().replace("-", "").take(8)
+        rememberRequest(requestId)
 
         return MeshPacket(
             type    = PacketType.ROUTE,
             srcId   = ourId,
             dstId   = destination,
             ttl     = MeshPacket.DEFAULT_TTL,
-            payload = rreqId.toByteArray(Charsets.UTF_8)
+            payload = "RREQ:$requestId:${destination}".toByteArray(Charsets.UTF_8)
         )
     }
 

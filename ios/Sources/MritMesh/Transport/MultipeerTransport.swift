@@ -10,11 +10,14 @@ import MultipeerConnectivity
 ///   Android uses WiFi Direct + BLE separately.
 ///   These are NOT directly compatible at the transport layer.
 ///   iOS↔iOS and Android↔Android work natively.
-///   iOS↔Android interop via BLE GATT bridge is planned for Phase 5.
+///   As of Phase 5, the MMP packet format, AES-256-GCM wire format, and EC
+///   public key encoding (65-byte x963) are byte-for-byte identical on both
+///   platforms — see PROTOCOL.md. A real iOS↔Android *link* still requires a
+///   shared transport, which is the Phase 6 BLE GATT bridge.
 ///
 /// MeshID handshake:
 ///   When a peer connects, we immediately send a DISCOVER packet containing
-///   our EC P-256 public key — identical handshake logic to Android.
+///   our EC P-256 public key (65-byte x963) — identical handshake logic to Android.
 ///
 /// Service type: "mrit-mesh"
 ///   Must be ≤15 chars, only lowercase ASCII letters, digits, and hyphens.

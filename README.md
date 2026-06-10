@@ -2,7 +2,10 @@
 
 > Phone-to-phone mesh network. No towers. No satellites. No infrastructure.
 
-MRIT is a from-scratch mesh networking stack for Android that lets phones communicate directly with each other — hop by hop — with zero internet infrastructure.
+MRIT is a from-scratch mesh networking stack for Android and iOS that lets phones communicate directly with each other — hop by hop — with zero internet infrastructure.
+
+The complete wire protocol is formally specified in **[PROTOCOL.md](PROTOCOL.md)** —
+the canonical reference both implementations are kept in sync against.
 
 ---
 
@@ -119,9 +122,55 @@ Delivered automatically when the destination comes into range.
 
 ---
 
+## Developer SDK / DSL (Phase 5)
+
+Most apps don't need to touch `MeshNode`, `MeshPacket`, or routing directly.
+The **Mrit** DSL wraps the whole stack behind `send()` / `sendFile()` / `sos()`
+and three declarative callbacks — `onMessage`, `onFile`, `onPeers` — and is
+implemented symmetrically on Android and iOS.
+
+**Android (Kotlin):**
+```kotlin
+val mesh = Mrit.start(applicationContext) {
+    onMessage { msg  -> log("From ${msg.from.shortId()}: ${msg.text}") }
+    onFile    { file -> saveToDisk(file.fileName, file.data) }
+    onPeers   { peers -> updatePeerChips(peers) }
+}
+
+mesh.send(peerId, "Hello mesh!")
+mesh.sendFile(peerId, "map.png", bytes)
+mesh.sos("Need help — twisted ankle, 2km north of trailhead")
+
+// ... later, e.g. in onDestroy()
+mesh.stop()
+```
+
+**iOS (Swift):**
+```swift
+let mesh = Mrit { config in
+    config.onMessage { msg in print("From \(msg.from.shortId): \(msg.text)") }
+    config.onFile    { file in save(file.fileName, file.data) }
+    config.onPeers   { peers in updatePeerList(peers) }
+}
+
+mesh.send(to: peerId, text: "Hello mesh!")
+mesh.sendFile(to: peerId, name: "map.png", data: bytes)
+mesh.sos("Need help — twisted ankle, 2km north of trailhead")
+
+// ... later
+mesh.stop()
+```
+
+The DSL is a thin layer — `mesh.node` (Android) / `mesh.node` (iOS) still
+exposes the full `MeshNode` API for advanced use cases.
+
+---
+
 ## Project Structure
 
 ```
+PROTOCOL.md                       — canonical MMP v1 wire-format spec (Phase 5)
+
 app/src/main/java/com/mrit/mesh/
 ├── core/
 │   ├── MeshID.kt               — 256-bit node identity
@@ -147,6 +196,8 @@ app/src/main/java/com/mrit/mesh/
 │   └── FileTransferManager.kt  — 32KB chunked file send/reassemble (Phase 4)
 ├── mesh/
 │   └── MeshNode.kt             — complete mesh API: sendMessage/sendFile/sendSOS
+├── dsl/
+│   └── Mrit.kt                 — high-level Mrit DSL: send/sendFile/sos + onMessage/onFile/onPeers (Phase 5)
 ├── service/
 │   └── MeshService.kt          — foreground service lifecycle
 ├── ui/
@@ -167,9 +218,11 @@ ios/                            — Swift Package (Phase 4)
     │   └── MeshCrypto.swift    — CryptoKit ECDH + AES.GCM, same derivation as Android
     ├── Transport/
     │   └── MultipeerTransport.swift — MultipeerConnectivity, service "mrit-mesh"
-    └── Mesh/
-        ├── MeshNode.swift      — iOS public API (sendMessage/sendFile/sendSOS)
-        └── FileTransferManager.swift — chunked file transfer, binary-compatible payloads
+    ├── Mesh/
+    │   ├── MeshNode.swift      — iOS public API (sendMessage/sendFile/sendSOS)
+    │   └── FileTransferManager.swift — chunked file transfer, binary-compatible payloads
+    └── DSL/
+        └── Mrit.swift          — high-level Mrit DSL: send/sendFile/sos + onMessage/onFile/onPeers (Phase 5)
 ```
 
 ---
@@ -180,7 +233,8 @@ ios/                            — Swift Package (Phase 4)
 - [x] **Phase 2** — Peer registry, WiFi Direct handshake, full routing, messaging UI
 - [x] **Phase 3** — E2E encryption (ECDH + AES-256-GCM), ACK + retry, multi-hop RREQ/RREP
 - [x] **Phase 4** — iOS Swift Package (9 files, binary-compatible), Android Keystore key storage, encrypted 32KB chunked file transfer, 11-test crypto suite
-- [ ] **Phase 5** — Cross-platform DSL for mesh-aware application development
+- [x] **Phase 5** — Cross-platform protocol reconciliation: 65-byte x963 EC public keys on Android (matching iOS CryptoKit), AODV RREQ payload bugfix (multi-hop routing on Android), iOS AES-GCM empty-plaintext decrypt fix, formal [PROTOCOL.md](PROTOCOL.md) spec, and the `Mrit` developer DSL (Android + iOS)
+- [ ] **Phase 6** — BLE GATT transport bridge for real iOS↔Android interop (MultipeerConnectivity and WiFi Direct/BLE are not directly compatible at the transport layer; protocol/crypto/encoding are already byte-compatible per Phase 5)
 
 ---
 

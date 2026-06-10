@@ -281,7 +281,8 @@ class WifiDirectTransport(
 
     /**
      * Build a DISCOVER (handshake) packet.
-     * Phase 3: payload = our EC P-256 public key bytes (X.509 DER, ~91 bytes)
+     * Payload = our EC P-256 public key as a 65-byte x963 point (0x04 || X || Y) —
+     * see KeyManager and PROTOCOL.md. Identical format to iOS CryptoKit.
      * The receiver uses this to compute the ECDH shared key.
      */
     private fun buildDiscoverPacket(): MeshPacket = MeshPacket(

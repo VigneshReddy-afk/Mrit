@@ -57,7 +57,9 @@ public enum MeshCrypto {
     ///
     /// Returns nil if authentication fails (tampered data or wrong key).
     public static func decrypt(_ data: Data, using key: SymmetricKey) -> Data? {
-        guard data.count > 28 else { return nil }  // 12-byte nonce + at least 1 byte + 16-byte tag
+        // 12-byte nonce + 16-byte tag = 28 bytes minimum (zero-length plaintext is valid GCM input).
+        // Matches Android's MeshCrypto.decrypt bound: `data.size < GCM_IV_LEN + GCM_TAG_LEN/8`.
+        guard data.count >= 28 else { return nil }
 
         let nonceData  = data.prefix(12)
         let remaining  = data.dropFirst(12)

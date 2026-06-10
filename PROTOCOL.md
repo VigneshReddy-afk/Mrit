@@ -1,0 +1,413 @@
+# MMP — Mobile Mesh Protocol Specification
+
+**Version:** 1 (`MMP_VERSION = 0x01`)
+**Status:** Implemented by `app/` (Android/Kotlin) and `ios/` (Swift Package), kept in sync as of Phase 5.
+
+This document is the single source of truth for the MRIT wire format. If the
+Android and iOS implementations ever disagree with each other, **this
+document wins** — and whichever implementation drifted is the bug.
+
+---
+
+## 1. Design goals
+
+- **No infrastructure.** Every node is both a client and a router.
+- **Binary compatible across platforms.** A packet built by an Android phone
+  must decode, route, and decrypt correctly on an iPhone, byte for byte.
+- **Fail closed, fail silent.** Malformed input is dropped, never thrown.
+  A hostile or corrupted packet must not crash a node.
+- **Small.** 69-byte header. No JSON, no XML, no variable-length integers.
+
+---
+
+## 2. Packet format
+
+Every unit of data on the mesh is a **MeshPacket**: a 69-byte fixed header
+followed by 0–65535 bytes of payload. All multi-byte integers are
+**big-endian** (network byte order).
+
+```
+┌──────────┬──────────┬────────────┬────────────┬──────────┬──────────┬──────────────┐
+│ VERSION  │   TYPE   │   SRC_ID   │   DST_ID   │   TTL    │  LENGTH  │   PAYLOAD    │
+│  1 byte  │  1 byte  │  32 bytes  │  32 bytes  │  1 byte  │  2 bytes │   N bytes    │
+└──────────┴──────────┴────────────┴────────────┴──────────┴──────────┴──────────────┘
+  [0]         [1]        [2..33]      [34..65]     [66]      [67..68]    [69..69+N-1]
+```
+
+| Field | Offset | Size | Type | Description |
+|---|---|---|---|---|
+| VERSION | 0 | 1 | `uint8` | Protocol version. Currently always `0x01`. |
+| TYPE | 1 | 1 | `uint8` | One of the [packet types](#3-packet-types) below. |
+| SRC_ID | 2 | 32 | bytes | Sender's [MeshID](#4-meshid). |
+| DST_ID | 34 | 32 | bytes | Recipient's MeshID, or `BROADCAST` (32× `0xFF`). |
+| TTL | 66 | 1 | `uint8` | Hop count remaining. Decremented by every relay. Packet dies at 0. |
+| LENGTH | 67 | 2 | `uint16` | Payload length in bytes (0–65535). |
+| PAYLOAD | 69 | N | bytes | Type-specific content — see §3. |
+
+- Total size: `69 + N` bytes, max `69 + 65535 = 65604` bytes.
+- `TTL` starts at `DEFAULT_TTL = 64` for normal traffic, `SOS_TTL = 255` for
+  emergency broadcasts, and `1` for DISCOVER (handshake never hops).
+- A decoder that receives fewer than 69 bytes, an unknown TYPE byte, or a
+  declared LENGTH that doesn't fit the remaining buffer **must return null /
+  drop the packet** — never throw or crash.
+
+**Reference implementations:**
+- Android: `app/src/main/java/com/mrit/mesh/core/MeshPacket.kt`,
+  `protocol/MMPEncoder.kt`, `protocol/MMPDecoder.kt`
+- iOS: `ios/Sources/MritMesh/Core/MeshPacket.swift`,
+  `ios/Sources/MritMesh/Protocol/MMPCodec.swift`
+
+---
+
+## 3. Packet types
+
+| Type | Byte | Forwarded by routers? | Encrypted? | Payload |
+|---|---|---|---|---|
+| `MSG` | `0x01` | Yes (multi-hop) | Yes (AES-256-GCM, §6) | UTF-8 text, encrypted |
+| `ACK` | `0x02` | Yes | No | UTF-8 `"ACK:{fingerprint}"` |
+| `DISCOVER` | `0x03` | No (TTL=1, link-local only) | No | 65-byte EC public key (§5) |
+| `ROUTE` | `0x04` | Yes | No | UTF-8 RREQ/RREP string (§7) |
+| `SOS` | `0x05` | Yes, always (TTL=255, ignores routing table) | No — must be readable by anyone | UTF-8 text |
+| `FILE_CHUNK` | `0x06` | Yes (multi-hop) | Yes (AES-256-GCM, §6) | Binary chunk header + data (§8) |
+
+### 3.1 MSG
+
+`payload = AES-256-GCM(plaintext_utf8, sharedKey)` — see §6 for the wire
+format of the ciphertext. If no shared key exists yet for the destination
+(handshake hasn't completed), implementations fall back to sending the raw
+UTF-8 plaintext rather than dropping the message; the receiver tries
+decryption first and falls back to interpreting the payload as plaintext UTF-8
+if decryption fails.
+
+Every delivered MSG triggers an ACK (§3.2) back to `srcId`.
+
+### 3.2 ACK
+
+```
+payload = "ACK:" + fingerprint
+fingerprint = hex(SHA-256(srcId.bytes ++ dstId.bytes ++ payload))[0:8]   (4 bytes → 8 hex chars)
+```
+
+`srcId`, `dstId`, and `payload` above refer to the **original MSG/FILE_CHUNK
+packet being acknowledged** — not the ACK packet itself. Both platforms must
+compute the fingerprint identically (`MeshCrypto.packetFingerprint`).
+
+### 3.3 DISCOVER
+
+Sent immediately when a transport-level connection is established (WiFi
+Direct socket connect, or MultipeerConnectivity peer becomes `.connected`).
+`ttl = 1` — never relayed.
+
+```
+payload = 65-byte x963 uncompressed EC P-256 public key: 0x04 || X(32) || Y(32)
+```
+
+The receiver uses this to derive a per-peer shared AES-256 key via ECDH
+(§5/§6). See §5 for why this format was chosen and how Android encodes it.
+
+### 3.4 ROUTE (AODV)
+
+See §7 for the full route-discovery state machine. Payload is always a
+UTF-8 string with one of two prefixes:
+
+```
+"RREQ:{requestId}:{destinationHexId}"
+"RREP:{requestId}:{destinationHexId}"
+```
+
+- `requestId` — 8 lowercase hex characters, randomly generated by the
+  original requester. Used for loop-prevention (a node that has already seen
+  this `requestId` drops the duplicate instead of re-broadcasting).
+- `destinationHexId` — the **full 64-character hex MeshID** of the node the
+  requester is trying to reach. **Must be the full ID, not the 8-character
+  `shortId`** — `MeshID.fromHex()` requires exactly 64 characters and returns
+  null/nil for anything else.
+
+### 3.5 SOS
+
+Unencrypted, `ttl = 255`, broadcast to `BROADCAST` (32× `0xFF`). Routers
+forward SOS unconditionally — even if they have no route to anywhere and even
+if their routing table is empty — because a stranger's life may depend on it
+reaching the next hop. Payload is raw UTF-8 text.
+
+### 3.6 FILE_CHUNK
+
+See §8. Payload is `AES-256-GCM(chunkHeader + chunkData, sharedKey)`, with the
+same fallback-to-plaintext behavior as MSG if no shared key exists yet.
+
+---
+
+## 4. MeshID
+
+A MeshID is a 32-byte (256-bit) value that permanently identifies a node.
+
+```
+MeshID = SHA-256(EC_P256_PublicKey_bytes ++ InstallTimestampMillis ++ RandomSalt32)
+```
+
+- Generated **once**, on first launch, and persisted (encrypted SharedPreferences
+  on Android, Keychain-backed UserDefaults on iOS).
+- The EC key pair, timestamp encoding, and salt used in this hash are
+  **per-platform implementation details** — MeshID generation is a local,
+  one-time operation and does **not** need to be reproducible across
+  platforms or devices. Only the **resulting 32 bytes**, and how they're
+  serialized on the wire (raw bytes in the packet header, 64-char lowercase
+  hex in routing-string payloads), need to match.
+- `BROADCAST = 32 × 0xFF` is reserved and can never be a real node's MeshID
+  (probability of collision is `2^-256`).
+- Display format: first 8 bytes as uppercase hex (`shortId`), e.g. `A3F79C12`.
+  **`shortId` is for UI/logs only — never use it in protocol payloads** (see
+  §3.4 and the Phase 5 bugfix in §11).
+
+**Reference implementations:**
+`app/src/main/java/com/mrit/mesh/core/MeshID.kt`,
+`ios/Sources/MritMesh/Core/MeshID.swift`
+
+---
+
+## 5. EC public key encoding (DISCOVER payload)
+
+Both platforms use **EC P-256 (secp256r1 / NIST P-256)**. The public key is
+embedded in DISCOVER packets so peers can derive a shared secret via ECDH
+(§6) without any prior key exchange.
+
+**Canonical wire format: 65-byte x963 uncompressed point.**
+
+```
+byte 0      : 0x04                  (uncompressed point indicator)
+bytes 1-32  : X coordinate, big-endian, zero-padded to 32 bytes
+bytes 33-64 : Y coordinate, big-endian, zero-padded to 32 bytes
+```
+
+This is exactly `P256.KeyAgreement.PublicKey.x963Representation` on iOS
+(CryptoKit produces this natively). Android has no x963 API in the standard
+JCA, so `KeyManager` encodes/decodes it manually:
+
+- **Encode:** read `(ECPublicKey).w.affineX` / `.affineY` as `BigInteger`,
+  convert each to exactly 32 big-endian bytes (stripping the sign byte
+  `BigInteger.toByteArray()` sometimes prepends, or zero-padding if the
+  value is small), prepend `0x04`.
+- **Decode:** split the 65 bytes into `X`/`Y`, build a
+  `java.security.spec.ECPoint`, combine with the secp256r1
+  `ECParameterSpec` (obtained via `AlgorithmParameters.getInstance("EC")`),
+  and call `KeyFactory.getInstance("EC").generatePublic(ECPublicKeySpec(...))`.
+
+> **Internal storage is unaffected.** Android persists its own key pair to
+> EncryptedSharedPreferences using the JCA default `.encoded` (X.509/PKCS8
+> DER). That format never touches the wire — only `publicKeyBytes` (x963,
+> 65 bytes) is ever sent in a DISCOVER packet.
+
+**Reference implementations:**
+`app/src/main/java/com/mrit/mesh/crypto/KeyManager.kt`,
+`ios/Sources/MritMesh/Crypto/KeyManager.swift`
+
+---
+
+## 6. Encryption
+
+| Step | Algorithm | Detail |
+|---|---|---|
+| Key generation | EC P-256 | One key pair per device, generated on first install, hardware-backed storage |
+| Key exchange | ECDH | Public keys exchanged as 65-byte x963 points in DISCOVER (§5) |
+| Key derivation | SHA-256 | `AES_key = SHA-256(ECDH_raw_shared_secret)` → 32 bytes |
+| Encryption | AES-256-GCM | 12-byte random nonce per message, 128-bit (16-byte) auth tag |
+
+**Wire format of an encrypted payload:**
+
+```
+[ 12 bytes : random nonce/IV ] [ N bytes : ciphertext ] [ 16 bytes : GCM auth tag ]
+```
+
+Total overhead: 28 bytes. Minimum valid encrypted payload size is **28 bytes**
+(empty plaintext is valid GCM input — encrypting zero bytes still produces a
+12-byte nonce + 16-byte tag with no ciphertext). Any payload shorter than 28
+bytes is not a valid encrypted MMP payload and `decrypt()` must return
+null/nil. Any tampering with nonce, ciphertext, or tag causes GCM
+authentication to fail → `decrypt()` returns null/nil → caller falls back to
+treating the payload as plaintext UTF-8 (see §3.1).
+
+A fresh random nonce **must** be generated for every encryption — nonce reuse
+under the same key breaks GCM's confidentiality guarantees catastrophically.
+
+**Reference implementations:**
+`app/src/main/java/com/mrit/mesh/crypto/MeshCrypto.kt`,
+`ios/Sources/MritMesh/Crypto/MeshCrypto.swift`
+
+---
+
+## 7. Routing — AODV
+
+MRIT uses a simplified **Ad-hoc On-Demand Distance Vector** routing protocol
+(RFC 3561 family).
+
+### 7.1 Routing table
+
+Each node maintains `destination → (nextHop, expiresAt)`. Entries expire
+`ROUTE_EXPIRY_MS = 30000` ms (30s) after being recorded — phones move, so
+routes go stale quickly. Every received packet (of any type) records a
+reverse route: "`packet.srcId` is reachable via `packet.srcId`" (i.e. the
+direct neighbor that handed us this packet is recorded as the next hop to
+that neighbor itself — multi-hop reverse paths are built up as RREQ/RREP
+propagate, per §7.2–7.3).
+
+### 7.2 Route discovery (RREQ)
+
+When node **A** needs to reach node **D** and has no route:
+
+1. A generates a random 8-hex-char `requestId`, remembers it (loop
+   prevention), and broadcasts:
+   ```
+   ROUTE { srcId: A, dstId: D, ttl: 64, payload: "RREQ:{requestId}:{D's full 64-hex MeshID}" }
+   ```
+2. A stores the original packet (queued for delivery once a route is found)
+   and broadcasts the RREQ to all directly-connected peers.
+3. Each receiving node **B**:
+   - If `requestId` was already seen → drop (loop prevention,
+     `MAX_SEEN_REQUESTS = 512` most-recently-seen IDs are remembered, oldest
+     evicted first).
+   - Records a reverse route: "A is reachable via the peer that forwarded
+     this RREQ".
+   - If `B == D`, or B already has a direct route to D → B sends an RREP
+     (§7.3) back toward A.
+   - Otherwise, if `packet.isAlive()` (TTL > 0 after decrement) → B
+     re-broadcasts the RREQ with TTL−1.
+
+### 7.3 Route reply (RREP)
+
+```
+ROUTE { srcId: <replier>, dstId: <replyTo>, ttl: 64, payload: "RREP:{requestId}:{D's full 64-hex MeshID}" }
+```
+
+- The replier records nothing new about itself (it already knows the route
+  to D — that's why it's replying).
+- Each node along the reverse path records "`D` is reachable via
+  `packet.srcId`" (the node that sent us this RREP).
+- If `packet.dstId == ourId`, we are the original requester **A**: the route
+  to D is now known — flush any packets queued for D in the
+  store-and-forward queue (§9) to the next hop.
+- Otherwise, forward the RREP (TTL−1) toward `packet.dstId` (the original
+  requester), using the reverse route established in step 7.2.
+
+### 7.4 Routing decisions
+
+For every received packet, a node decides one of:
+
+| Decision | When | Action |
+|---|---|---|
+| `Deliver` | `packet.dstId == ourId` | Pass to application layer (§3) |
+| `DeliverAndForward` | `packet.dstId == BROADCAST`, or `type == SOS` | Deliver locally AND re-broadcast (TTL−1) to all peers except the sender |
+| `Forward` | We have a route to `dstId` | Send (TTL−1) to the next hop |
+| `StoreAndDiscover` | No route to `dstId` known | Queue in PacketStore (§9), broadcast RREQ |
+| `Drop` | TTL expired (0) | Discard silently |
+
+**Reference implementations:**
+`app/src/main/java/com/mrit/mesh/routing/AODVRouter.kt`,
+`app/src/main/java/com/mrit/mesh/mesh/MeshNode.kt` (`handleRREQ`/`handleRREP`),
+`ios/Sources/MritMesh/Mesh/MeshNode.swift` (`handleRREQ`/`handleRREP`)
+
+---
+
+## 8. File transfer (FILE_CHUNK)
+
+Files of arbitrary size are split into 32 KB chunks, each sent as its own
+encrypted `FILE_CHUNK` packet. Chunks may arrive out of order — the receiver
+reassembles by `chunkIndex`.
+
+**Decrypted chunk payload format** (binary identical on both platforms):
+
+```
+┌────────────┬─────────────┬──────────────┬─────────────┬───────────┬──────────┬───────────┐
+│ TRANSFER_ID │ CHUNK_INDEX │ TOTAL_CHUNKS │ TOTAL_SIZE  │ NAME_LEN  │  NAME    │   DATA    │
+│  16 bytes   │   4 bytes   │   4 bytes    │  4 bytes    │  2 bytes  │ N bytes  │  M bytes  │
+└────────────┴─────────────┴──────────────┴─────────────┴───────────┴──────────┴───────────┘
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| TRANSFER_ID | 16 random bytes | Identifies all chunks of one file transfer. Generated once per `send()` call. |
+| CHUNK_INDEX | `uint32` BE | 0-based index of this chunk. |
+| TOTAL_CHUNKS | `uint32` BE | `ceil(fileSize / 32768)`. |
+| TOTAL_SIZE | `uint32` BE | Total file size in bytes (max ~4 GiB). |
+| NAME_LEN | `uint16` BE | Length of NAME in bytes. **Non-zero only in chunk 0** — all other chunks have `NAME_LEN = 0` and no NAME field. |
+| NAME | UTF-8, `NAME_LEN` bytes | Original filename. Only present when `CHUNK_INDEX == 0`. |
+| DATA | up to 32768 bytes | Raw chunk bytes. The last chunk may be shorter than 32768 bytes. |
+
+`CHUNK_SIZE = 32768` (32 KiB) was chosen to stay well within
+`MAX_PAYLOAD_SIZE = 65535` even after AES-GCM's 28-byte overhead and the
+30-byte chunk header.
+
+The receiver buffers chunks by `(transferId, chunkIndex)` until
+`chunks.size == totalChunks`, then concatenates `chunks[0], chunks[1], ...,
+chunks[totalChunks-1]` in order to reproduce the original file bytes exactly.
+
+**Reference implementations:**
+`app/src/main/java/com/mrit/mesh/transfer/FileTransferManager.kt`,
+`ios/Sources/MritMesh/Mesh/FileTransferManager.swift`
+
+---
+
+## 9. Reliability — ACK + retry
+
+Every `MSG` (and only `MSG` — not `SOS`, `ROUTE`, or `FILE_CHUNK`) sent is
+tracked by the sender:
+
+- `ACK_TIMEOUT_MS = 5000` — if no ACK (§3.2) arrives within 5s, retry.
+- `MAX_RETRIES = 3` — after 3 retries (4 total attempts) with no ACK, the
+  packet is abandoned and the sender is notified of delivery failure.
+- A retry checker runs every `CHECK_INTERVAL = 1000` ms.
+
+**Reference implementation:** `app/src/main/java/com/mrit/mesh/reliability/AckManager.kt`
+(iOS port tracked for a future phase — currently iOS receives and answers
+ACKs but does not yet retry its own outgoing MSGs.)
+
+---
+
+## 10. Store-and-forward
+
+Packets destined for a node with no current route are persisted (SQLite on
+Android) for up to **24 hours**, keyed by destination MeshID. When a route to
+that destination is discovered (RREP, §7.3) or the destination connects
+directly (DISCOVER, §3.3), all queued packets are flushed to the new next hop
+and removed from the store.
+
+**Reference implementation:** `app/src/main/java/com/mrit/mesh/storage/PacketStore.kt`
+
+---
+
+## 11. Implementation conformance notes (Phase 5)
+
+This section documents bugs found and fixed while writing this spec, so they
+are not silently reintroduced.
+
+- **Android RREQ payload bug (fixed):** `AODVRouter.buildRouteRequest()`
+  previously built `"RREQ:{ourId.shortId()}:{destination.shortId()}:{timestamp}"`
+  — using 8-character `shortId()` values. `MeshNode.handleRREQ()` (and the
+  spec in §3.4/§7.2) require the **full 64-character hex MeshID** for the
+  destination field, since `MeshID.fromHex()` rejects anything that isn't 64
+  characters. The result was that **every Android-originated RREQ silently
+  failed to parse on arrival**, breaking multi-hop discovery for any
+  destination not directly connected. Fixed to emit
+  `"RREQ:{random8HexRequestId}:{destination.toString() /* full 64-hex */}"`,
+  matching the iOS implementation (which was already correct).
+- **iOS decrypt boundary (fixed):** `MeshCrypto.decrypt` required
+  `data.count > 28`, rejecting the valid 28-byte ciphertext produced by
+  encrypting an empty plaintext. Changed to `>= 28` to match Android's
+  `data.size < GCM_IV_LEN + GCM_TAG_LEN/8` check.
+- **Public key wire format (fixed):** prior to Phase 5, Android embedded its
+  public key in DISCOVER as X.509 DER (~91 bytes) while iOS used 65-byte
+  x963. An Android↔iOS handshake would have failed to derive a shared key.
+  Both platforms now use 65-byte x963 (§5).
+
+---
+
+## 12. Versioning policy
+
+- `MMP_VERSION = 0x01` covers the header layout in §2 and all packet types
+  in §3.
+- A future incompatible header change would bump to `0x02`; decoders should
+  reject (drop) packets with an unrecognized version rather than
+  misinterpreting them.
+- Changes to *payload* formats (key encoding, RREQ/RREP strings, chunk
+  headers) that don't change the 69-byte header are tracked as amendments to
+  this document and applied to both platforms in the same phase — they do
+  not bump `MMP_VERSION`, but mismatched implementations are considered bugs.

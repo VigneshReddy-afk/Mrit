@@ -28,9 +28,10 @@ public class KeyManager {
     /// Format: 04 || X (32 bytes) || Y (32 bytes)
     /// This is what we embed in DISCOVER packets.
     ///
-    /// Note: Android sends X.509 DER format (~91 bytes), but for iOS↔iOS we use
-    /// x963 (65 bytes). When iOS↔Android interop is added in Phase 5, the codec
-    /// will detect and handle both formats.
+    /// Phase 5: Android's KeyManager now encodes/decodes the same 65-byte x963
+    /// format (via java.security.spec.ECPoint + secp256r1 ECParameterSpec), so
+    /// DISCOVER payloads — and the ECDH shared keys derived from them — are
+    /// identical on both platforms. See PROTOCOL.md.
     public var publicKeyBytes: Data { privateKey.publicKey.x963Representation }
 
     public init() {
