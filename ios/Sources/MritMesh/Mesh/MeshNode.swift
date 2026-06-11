@@ -23,7 +23,8 @@ public class MeshNode {
 
     // ── Components ─────────────────────────────────────────────────────────────
 
-    private var transport:      MultipeerTransport!
+    private var transport:        MultipeerTransport!
+    private var bleGattTransport: BleGattTransport!
     private var peerRegistry    = [String: PeerEntry]()     // meshId hex → PeerEntry
     private var sharedKeys      = [String: SymmetricKey]()  // meshId hex → AES key
     private var routingTable    = [String: String]()        // dest hex  → next-hop hex
@@ -43,6 +44,7 @@ public class MeshNode {
     public init() {
         self.ourId    = Self.loadOrCreateMeshId()
         self.transport = MultipeerTransport(ourId: ourId, keyManager: keyManager)
+        self.bleGattTransport = BleGattTransport(ourId: ourId, keyManager: keyManager)
         self.fileManager = FileTransferManager(
             ourId:    ourId,
             sendPacket: { [weak self] packet, dest in self?.dispatchPacket(packet, to: dest) },
@@ -55,11 +57,13 @@ public class MeshNode {
 
     public func start() {
         transport.start()
+        bleGattTransport.start()
         print("[MeshNode] Started — id=\(ourId.shortId)")
     }
 
     public func stop() {
         transport.stop()
+        bleGattTransport.stop()
     }
 
     // ── Send API ───────────────────────────────────────────────────────────────
@@ -93,20 +97,14 @@ public class MeshNode {
             transport.broadcast(packet)
             return
         }
-        // Direct route known?
-        lock.lock()
-        let hasDirectRoute = peerRegistry[dest.hexString] != nil
-        lock.unlock()
-
-        if hasDirectRoute {
-            transport.send(packet, to: dest)
-        } else {
-            // Store and broadcast RREQ
-            lock.lock()
-            packetStore[dest.hexString, default: []].append(packet)
-            lock.unlock()
-            broadcastRREQ(for: dest)
+        if transmit(packet, to: dest) {
+            return
         }
+        // No route yet — store and broadcast RREQ
+        lock.lock()
+        packetStore[dest.hexString, default: []].append(packet)
+        lock.unlock()
+        broadcastRREQ(for: dest)
     }
 
     private func route(_ packet: MeshPacket) {
@@ -121,17 +119,50 @@ public class MeshNode {
         }
         guard packet.isAlive else { return }
 
+        if transmit(packet.decrementingTTL(), to: packet.dstId) {
+            return
+        }
         lock.lock()
-        let hasRoute = peerRegistry[packet.dstId.hexString] != nil
+        packetStore[packet.dstId.hexString, default: []].append(packet)
         lock.unlock()
+        broadcastRREQ(for: packet.dstId)
+    }
 
-        if hasRoute {
-            transport.send(packet.decrementingTTL(), to: packet.dstId)
-        } else {
-            lock.lock()
-            packetStore[packet.dstId.hexString, default: []].append(packet)
-            lock.unlock()
-            broadcastRREQ(for: packet.dstId)
+    /// Send `packet` to `dest` over whichever transport currently reaches it —
+    /// Multipeer (iOS↔iOS) first, falling back to the BLE GATT bridge
+    /// (iOS↔Android / iOS↔iOS without Multipeer) per PROTOCOL.md §11.5.
+    /// Returns false if no transport currently has a link to `dest`.
+    @discardableResult
+    private func transmit(_ packet: MeshPacket, to dest: MeshID) -> Bool {
+        lock.lock()
+        let entry = peerRegistry[dest.hexString]
+        lock.unlock()
+        guard let entry = entry else { return false }
+
+        if entry.hasMultipeerLink {
+            transport.send(packet, to: dest)
+            return true
+        }
+        if let bleAddress = entry.bleAddress {
+            bleGattTransport.send(packet, to: bleAddress)
+            return true
+        }
+        return false
+    }
+
+    /// Forward `packet` to every known peer, regardless of whether it's the
+    /// intended next hop — last-resort fallback when [transmit] can't find a
+    /// direct route (PROTOCOL.md §11.5).
+    private func forwardToAllPeers(_ packet: MeshPacket) {
+        lock.lock()
+        let entries = Array(peerRegistry.values)
+        lock.unlock()
+        for entry in entries {
+            if entry.hasMultipeerLink {
+                transport.send(packet, to: entry.meshId)
+            } else if let bleAddress = entry.bleAddress {
+                bleGattTransport.send(packet, to: bleAddress)
+            }
         }
     }
 
@@ -175,7 +206,7 @@ public class MeshNode {
             type: .ack, srcId: ourId, dstId: original.srcId,
             payload: Data("ACK:\(fp)".utf8)
         )
-        transport.send(ack, to: original.srcId)
+        transmit(ack, to: original.srcId)
     }
 
     // ── RREQ / RREP ────────────────────────────────────────────────────────────
@@ -241,7 +272,10 @@ public class MeshNode {
             // We are original requester — flush stored packets
             flushStored(for: dest)
         } else if packet.isAlive {
-            transport.send(packet.decrementingTTL(), to: packet.dstId)
+            let forwarded = packet.decrementingTTL()
+            if !transmit(forwarded, to: packet.dstId) {
+                forwardToAllPeers(forwarded)
+            }
         }
     }
 
@@ -251,14 +285,16 @@ public class MeshNode {
             ttl: MeshPacket.defaultTTL,
             payload: Data("RREP:\(requestId):\(destination.hexString)".utf8)
         )
-        transport.send(rrep, to: replyTo)
+        if !transmit(rrep, to: replyTo) {
+            forwardToAllPeers(rrep)
+        }
     }
 
     private func flushStored(for destination: MeshID) {
         lock.lock()
         let queued = packetStore.removeValue(forKey: destination.hexString) ?? []
         lock.unlock()
-        queued.forEach { transport.send($0, to: destination) }
+        queued.forEach { transmit($0, to: destination) }
     }
 
     // ── Peer handshake ─────────────────────────────────────────────────────────
@@ -273,6 +309,12 @@ public class MeshNode {
         transport.onPeerDisconnected = { [weak self] meshId in
             self?.removePeer(meshId)
         }
+        bleGattTransport.onPeerHandshake = { [weak self] handshake in
+            self?.handleBleHandshake(handshake)
+        }
+        bleGattTransport.onPacketReceived = { [weak self] packet in
+            self?.handleIncoming(packet)
+        }
     }
 
     private func handleHandshake(_ handshake: MultipeerTransport.PeerHandshake) {
@@ -286,7 +328,10 @@ public class MeshNode {
         }
 
         lock.lock()
-        let entry = PeerEntry(meshId: handshake.meshId)
+        var entry = peerRegistry[handshake.meshId.hexString]
+            ?? PeerEntry(meshId: handshake.meshId, bleAddress: nil, hasMultipeerLink: false)
+        entry.hasMultipeerLink = true
+        entry.lastSeen         = Date()
         peerRegistry[handshake.meshId.hexString] = entry
         if let key = sharedKey { sharedKeys[handshake.meshId.hexString] = key }
         lock.unlock()
@@ -294,6 +339,33 @@ public class MeshNode {
         flushStored(for: handshake.meshId)
         publishPeers()
         print("[MeshNode] Peer registered: \(handshake.meshId.shortId) encrypted=\(sharedKey != nil)")
+    }
+
+    /// Handle a completed BLE GATT handshake (PROTOCOL.md §11.4) — registers
+    /// (or updates) the peer with its `bleAddress`, deriving the shared
+    /// encryption key the same way as the Multipeer handshake.
+    private func handleBleHandshake(_ handshake: BleGattTransport.PeerHandshake) {
+        var sharedKey: SymmetricKey?
+        if !handshake.publicKeyBytes.isEmpty,
+           let peerPubKey = KeyManager.publicKeyFromBytes(handshake.publicKeyBytes) {
+            sharedKey = try? MeshCrypto.computeSharedKey(
+                ourPrivateKey:  keyManager.privateKey,
+                theirPublicKey: peerPubKey
+            )
+        }
+
+        lock.lock()
+        var entry = peerRegistry[handshake.meshId.hexString]
+            ?? PeerEntry(meshId: handshake.meshId, bleAddress: nil, hasMultipeerLink: false)
+        entry.bleAddress = handshake.bleAddress
+        entry.lastSeen   = Date()
+        peerRegistry[handshake.meshId.hexString] = entry
+        if let key = sharedKey { sharedKeys[handshake.meshId.hexString] = key }
+        lock.unlock()
+
+        flushStored(for: handshake.meshId)
+        publishPeers()
+        print("[MeshNode] Peer registered via BLE: \(handshake.meshId.shortId) encrypted=\(sharedKey != nil)")
     }
 
     private func handleIncoming(_ packet: MeshPacket) {
@@ -305,8 +377,14 @@ public class MeshNode {
 
     private func removePeer(_ meshId: MeshID) {
         lock.lock()
-        peerRegistry.removeValue(forKey: meshId.hexString)
-        sharedKeys.removeValue(forKey: meshId.hexString)
+        if var entry = peerRegistry[meshId.hexString], entry.bleAddress != nil {
+            // Still reachable via BLE — keep the entry, just drop the Multipeer link.
+            entry.hasMultipeerLink = false
+            peerRegistry[meshId.hexString] = entry
+        } else {
+            peerRegistry.removeValue(forKey: meshId.hexString)
+            sharedKeys.removeValue(forKey: meshId.hexString)
+        }
         lock.unlock()
         publishPeers()
     }
@@ -353,6 +431,10 @@ public class MeshNode {
 
     private struct PeerEntry {
         let meshId: MeshID
+        /// Set once a BLE GATT handshake (PROTOCOL.md §11.4) completes with this peer.
+        var bleAddress: String?
+        /// True while a Multipeer session to this peer is active.
+        var hasMultipeerLink: Bool
         var lastSeen = Date()
     }
 

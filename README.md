@@ -111,7 +111,40 @@ If ACK is not received within 5 seconds, the message is re-sent (up to 3 attempt
 | Layer | Technology | Range | Purpose |
 |---|---|---|---|
 | Discovery | Bluetooth LE | ~100 m | Always-on peer detection |
-| Data | WiFi Direct | ~200 m | Bulk packet transfer |
+| Data | WiFi Direct | ~200 m | Bulk packet transfer (Android↔Android) |
+| Data | Multipeer Connectivity | ~30 m | Bulk packet transfer (iOS↔iOS) |
+| Cross-platform bridge | Bluetooth LE GATT | ~10-30 m | iOS↔Android (and iOS↔iOS) data fallback (Phase 6) |
+
+---
+
+## BLE GATT Bridge (Phase 6)
+
+MultipeerConnectivity (iOS) and WiFi Direct (Android) are different radio
+protocols and can't talk to each other directly. Bluetooth LE GATT is the
+one transport every modern phone supports, so MRIT uses it as a universal
+bridge — **every node runs both GATT roles at once**:
+
+```
+┌─────────────┐                              ┌─────────────┐
+│   Node A    │  scans, connects, writes     │   Node B    │
+│  (CENTRAL)  │ ────────────────────────────▶│ (PERIPHERAL)│
+│ (PERIPHERAL)│◀──────────────────────────── │  (CENTRAL)  │
+└─────────────┘        notifications         └─────────────┘
+```
+
+- **Service UUID** `4d524954-0010-1000-8000-00805f9b34fb`, **data characteristic**
+  `4d524954-0011-1000-8000-00805f9b34fb` (WRITE + NOTIFY) — one connection is a
+  single bidirectional pipe: writes one way, notifications the other.
+- **Fragmentation** — packets are split to fit the negotiated ATT MTU. Each
+  fragment starts with a FLAGS byte (FIRST/LAST bits); the first fragment also
+  carries a 4-byte big-endian total-length prefix. Reassembled before MMP decode.
+- **Handshake** — the central enables notifications, sends a DISCOVER (its
+  public key), and the peripheral replies with its own DISCOVER. Both sides
+  derive the ECDH shared key and register the peer by `bleAddress`.
+- **Routing fallback** — `MeshNode` tries WiFi Direct/Multipeer first, falling
+  back to the BLE GATT link for any peer only reachable over BLE.
+- **Throughput** — roughly 1-4 KB/s, fine for chat/SOS text. See
+  [PROTOCOL.md §11](PROTOCOL.md) for the full spec and known limitations.
 
 ---
 
@@ -185,7 +218,8 @@ app/src/main/java/com/mrit/mesh/
 │   └── MMPDecoder.kt           — bytes → MeshPacket (null-safe)
 ├── transport/
 │   ├── WifiDirectTransport.kt  — data transfer + DISCOVER handshake over WiFi Direct
-│   └── BLETransport.kt         — peer discovery over Bluetooth LE
+│   ├── BLETransport.kt         — peer discovery over Bluetooth LE
+│   └── BleGattTransport.kt     — BLE GATT data bridge: fragmentation + handshake (Phase 6)
 ├── routing/
 │   └── AODVRouter.kt           — AODV routing engine (RREQ/RREP/route table)
 ├── reliability/
@@ -217,7 +251,8 @@ ios/                            — Swift Package (Phase 4)
     │   ├── KeyManager.swift    — iOS Keychain (SecItem) key persistence
     │   └── MeshCrypto.swift    — CryptoKit ECDH + AES.GCM, same derivation as Android
     ├── Transport/
-    │   └── MultipeerTransport.swift — MultipeerConnectivity, service "mrit-mesh"
+    │   ├── MultipeerTransport.swift — MultipeerConnectivity, service "mrit-mesh"
+    │   └── BleGattTransport.swift   — BLE GATT data bridge: CoreBluetooth, fragmentation + handshake (Phase 6)
     ├── Mesh/
     │   ├── MeshNode.swift      — iOS public API (sendMessage/sendFile/sendSOS)
     │   └── FileTransferManager.swift — chunked file transfer, binary-compatible payloads
@@ -234,7 +269,8 @@ ios/                            — Swift Package (Phase 4)
 - [x] **Phase 3** — E2E encryption (ECDH + AES-256-GCM), ACK + retry, multi-hop RREQ/RREP
 - [x] **Phase 4** — iOS Swift Package (9 files, binary-compatible), Android Keystore key storage, encrypted 32KB chunked file transfer, 11-test crypto suite
 - [x] **Phase 5** — Cross-platform protocol reconciliation: 65-byte x963 EC public keys on Android (matching iOS CryptoKit), AODV RREQ payload bugfix (multi-hop routing on Android), iOS AES-GCM empty-plaintext decrypt fix, formal [PROTOCOL.md](PROTOCOL.md) spec, and the `Mrit` developer DSL (Android + iOS)
-- [ ] **Phase 6** — BLE GATT transport bridge for real iOS↔Android interop (MultipeerConnectivity and WiFi Direct/BLE are not directly compatible at the transport layer; protocol/crypto/encoding are already byte-compatible per Phase 5)
+- [x] **Phase 6** — BLE GATT transport bridge for real iOS↔Android interop: `BleGattTransport` (Android, CoreBluetooth-equivalent GATT central+peripheral) and `BleGattTransport.swift` (iOS, CoreBluetooth), fragmentation/reassembly over the negotiated ATT MTU, DISCOVER-based ECDH handshake, and transport-fallback routing (`MeshNode.transmit`) on both platforms
+- [ ] **Phase 7** — Cross-platform field testing & BLE reliability hardening (connection retry/backoff, CoreBluetooth state restoration, multi-peer GATT scaling), plus mesh topology visualization in the UI
 
 ---
 

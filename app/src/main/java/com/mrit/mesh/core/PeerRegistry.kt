@@ -28,12 +28,21 @@ class PeerRegistry {
 
     // ── Write ──────────────────────────────────────────────────────────────────
 
-    /** Register or update a peer. Preserves existing BLE address and public key if absent. */
+    /**
+     * Register or update a peer. Preserves existing IP address, BLE address, and
+     * public key if the incoming [peer] doesn't carry them.
+     *
+     * This matters once a peer can be reached via more than one transport
+     * (Phase 6 BLE GATT bridge): a BLE-only handshake registers a [PeerInfo] with
+     * `ipAddress=""`, which must NOT clobber an `ipAddress` already learned via
+     * WiFi Direct for the same peer (and vice versa).
+     */
     fun register(peer: PeerInfo) {
         synchronized(lock) {
             val key      = peer.meshId.toString()
             val existing = table[key]
             table[key]   = peer.copy(
+                ipAddress  = peer.ipAddress.ifBlank { existing?.ipAddress ?: "" },
                 bleAddress = peer.bleAddress ?: existing?.bleAddress,
                 publicKey  = peer.publicKey  ?: existing?.publicKey
             )

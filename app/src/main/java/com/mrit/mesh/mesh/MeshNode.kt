@@ -15,6 +15,7 @@ import com.mrit.mesh.transfer.FileTransferManager
 import com.mrit.mesh.routing.RoutingDecision
 import com.mrit.mesh.storage.PacketStore
 import com.mrit.mesh.transport.BLETransport
+import com.mrit.mesh.transport.BleGattTransport
 import com.mrit.mesh.transport.WifiDirectTransport
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -61,6 +62,7 @@ class MeshNode(private val context: Context) {
     private val router        = AODVRouter(ourId)
     private val packetStore   = PacketStore(context)
     private val bleTransport  = BLETransport(context, ourId)
+    private val bleGattTransport = BleGattTransport(context, ourId, keyManager)
     private val wifiTransport = WifiDirectTransport(context, ourId, keyManager)
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -76,7 +78,7 @@ class MeshNode(private val context: Context) {
 
     private val ackManager = AckManager(
         scope            = scope,
-        onRetry          = { packet, ip -> wifiTransport.send(packet, ip) },
+        onRetry          = { packet, _ -> transmit(packet, packet.dstId) },
         onDeliveryFailed = { packet ->
             Log.w(TAG, "Delivery failed for packet to ${packet.dstId.shortId()}")
             _incomingMessages.tryEmit(
@@ -102,9 +104,11 @@ class MeshNode(private val context: Context) {
 
     fun start() {
         bleTransport.start()
+        bleGattTransport.start()
         wifiTransport.start()
         observeIncomingPackets()
         observePeerHandshakes()
+        observeBleHandshakes()
         observeDiscoveredNodes()
         startMaintenanceLoop()
         packetStore.purgeExpired()
@@ -113,8 +117,27 @@ class MeshNode(private val context: Context) {
 
     fun stop() {
         bleTransport.stop()
+        bleGattTransport.stop()
         wifiTransport.stop()
         scope.cancel()
+    }
+
+    // ── Internal — transport selection ─────────────────────────────────────────
+
+    /**
+     * Send [packet] to [dest] using whichever transport currently has a link to
+     * that peer. WiFi Direct is preferred (higher throughput); the BLE GATT
+     * bridge (Phase 6) is used as a fallback when only a BLE link exists —
+     * e.g. a real iOS↔Android connection. Returns false if neither transport
+     * has a link to [dest].
+     */
+    private fun transmit(packet: MeshPacket, dest: MeshID): Boolean {
+        val peer = peerRegistry.get(dest) ?: return false
+        return when {
+            peer.ipAddress.isNotBlank() -> { wifiTransport.send(packet, peer.ipAddress); true }
+            peer.bleAddress != null     -> { bleGattTransport.send(packet, peer.bleAddress); true }
+            else -> false
+        }
     }
 
     // ── Send API ───────────────────────────────────────────────────────────────
@@ -176,6 +199,13 @@ class MeshNode(private val context: Context) {
                 route(packet)
             }
         }
+        scope.launch {
+            bleGattTransport.incomingPackets.collect { packet ->
+                peerRegistry.touch(packet.srcId)
+                router.recordRoute(packet.srcId, packet.srcId)
+                route(packet)
+            }
+        }
     }
 
     private fun route(packet: MeshPacket) {
@@ -186,10 +216,7 @@ class MeshNode(private val context: Context) {
                 if (packet.isAlive()) forwardToAllPeers(packet.decrementTTL())
             }
             is RoutingDecision.Forward -> {
-                val ip = peerRegistry.getIpFor(decision.nextHop)
-                if (ip != null) {
-                    wifiTransport.send(packet.decrementTTL(), ip)
-                } else {
+                if (!transmit(packet.decrementTTL(), decision.nextHop)) {
                     packetStore.store(packet)
                     broadcastRREQ(packet.dstId)
                 }
@@ -203,10 +230,12 @@ class MeshNode(private val context: Context) {
     }
 
     private fun dispatchPacket(packet: MeshPacket) {
-        val ip = peerRegistry.getIpFor(packet.dstId)
-        if (ip != null) {
-            wifiTransport.send(packet, ip)
-            if (packet.type == PacketType.MSG) ackManager.trackOutgoing(packet, ip)
+        val peer = peerRegistry.get(packet.dstId)
+        if (peer != null && transmit(packet, packet.dstId)) {
+            if (packet.type == PacketType.MSG) {
+                val addr = peer.ipAddress.ifBlank { peer.bleAddress ?: "" }
+                ackManager.trackOutgoing(packet, addr)
+            }
         } else {
             packetStore.store(packet)
             broadcastRREQ(packet.dstId)
@@ -258,9 +287,7 @@ class MeshNode(private val context: Context) {
             ttl     = MeshPacket.DEFAULT_TTL,
             payload = ackPayload
         )
-        val ip = peerRegistry.getIpFor(originalMsg.srcId)
-        if (ip != null) {
-            wifiTransport.send(ack, ip)
+        if (transmit(ack, originalMsg.srcId)) {
             Log.d(TAG, "ACK sent to ${originalMsg.srcId.shortId()}")
         }
     }
@@ -337,16 +364,13 @@ class MeshNode(private val context: Context) {
 
         if (packet.dstId == ourId) {
             // We are the original requester — route found, flush stored packets
-            val ip = peerRegistry.getIpFor(packet.srcId)
-            if (ip != null) {
-                flushStoredPackets(destination, nextHopIp = ip)
+            val replyPeer = peerRegistry.get(packet.srcId)
+            if (replyPeer != null && (replyPeer.ipAddress.isNotBlank() || replyPeer.bleAddress != null)) {
+                flushStoredPackets(destination) { p -> transmit(p, packet.srcId) }
             }
         } else {
             // Forward RREP toward the original requester (packet.dstId)
-            val ip = peerRegistry.getIpFor(packet.dstId)
-            if (ip != null) {
-                wifiTransport.send(packet.decrementTTL(), ip)
-            } else {
+            if (!transmit(packet.decrementTTL(), packet.dstId)) {
                 forwardToAllPeers(packet.decrementTTL())
             }
         }
@@ -360,10 +384,7 @@ class MeshNode(private val context: Context) {
             ttl     = MeshPacket.DEFAULT_TTL,
             payload = "RREP:${requestId}:${destination}".toByteArray(Charsets.UTF_8)
         )
-        val ip = peerRegistry.getIpFor(replyTo)
-        if (ip != null) {
-            wifiTransport.send(rrep, ip)
-        } else {
+        if (!transmit(rrep, replyTo)) {
             forwardToAllPeers(rrep)
         }
     }
@@ -377,16 +398,24 @@ class MeshNode(private val context: Context) {
     private fun forwardToAllPeers(packet: MeshPacket) {
         peerRegistry.getAll().forEach { peer ->
             if (peer.meshId != packet.srcId) {
-                wifiTransport.send(packet, peer.ipAddress)
+                if (peer.ipAddress.isNotBlank()) {
+                    wifiTransport.send(packet, peer.ipAddress)
+                } else if (peer.bleAddress != null) {
+                    bleGattTransport.send(packet, peer.bleAddress)
+                }
             }
         }
     }
 
-    private fun flushStoredPackets(destination: MeshID, nextHopIp: String) {
+    /**
+     * Re-send any packets stored for [destination] using [send] — a transport-specific
+     * sender chosen by the caller (WiFi Direct IP or BLE GATT address).
+     */
+    private fun flushStoredPackets(destination: MeshID, send: (MeshPacket) -> Unit) {
         val stored = packetStore.getPendingFor(destination)
         if (stored.isEmpty()) return
-        Log.d(TAG, "Flushing ${stored.size} stored packet(s) to ${destination.shortId()} via $nextHopIp")
-        stored.forEach { wifiTransport.send(it.decrementTTL(), nextHopIp) }
+        Log.d(TAG, "Flushing ${stored.size} stored packet(s) to ${destination.shortId()}")
+        stored.forEach { send(it.decrementTTL()) }
         packetStore.clearDelivered(destination)
     }
 
@@ -421,7 +450,48 @@ class MeshNode(private val context: Context) {
                 router.recordRoute(handshake.meshId, handshake.meshId)
 
                 // Deliver any packets we stored for this peer before they connected
-                flushStoredPackets(handshake.meshId, nextHopIp = handshake.ipAddress)
+                flushStoredPackets(handshake.meshId) { wifiTransport.send(it, handshake.ipAddress) }
+            }
+        }
+    }
+
+    /**
+     * Observe handshakes completed over the BLE GATT bridge (Phase 6) — the
+     * transport used for real iOS↔Android links. Mirrors [observePeerHandshakes]
+     * but registers the peer with [PeerInfo.bleAddress] instead of an IP, since a
+     * BLE-only peer has no WiFi Direct/Multipeer IP address.
+     */
+    private fun observeBleHandshakes() {
+        scope.launch {
+            bleGattTransport.peerHandshakes.collect { handshake ->
+                // Reconstruct peer's public key from the bytes in DISCOVER payload
+                val peerPublicKey = if (handshake.publicKeyBytes.isNotEmpty()) {
+                    KeyManager.publicKeyFromBytes(handshake.publicKeyBytes)
+                } else null
+
+                // Derive and cache the shared AES-256 key for this peer
+                if (peerPublicKey != null) {
+                    val sharedKey = MeshCrypto.computeSharedKey(
+                        ourPrivateKey  = keyManager.privateKey,
+                        theirPublicKey = peerPublicKey
+                    )
+                    peerRegistry.storeSharedKey(handshake.meshId, sharedKey)
+                    Log.d(TAG, "Shared key derived for ${handshake.meshId.shortId()} via BLE — messages will be encrypted")
+                } else {
+                    Log.w(TAG, "No public key from ${handshake.meshId.shortId()} via BLE — messages unencrypted")
+                }
+
+                val peer = PeerInfo(
+                    meshId     = handshake.meshId,
+                    ipAddress  = "",
+                    bleAddress = handshake.bleAddress,
+                    publicKey  = peerPublicKey
+                )
+                peerRegistry.register(peer)
+                router.recordRoute(handshake.meshId, handshake.meshId)
+
+                // Deliver any packets we stored for this peer before they connected
+                flushStoredPackets(handshake.meshId) { bleGattTransport.send(it, handshake.bleAddress) }
             }
         }
     }

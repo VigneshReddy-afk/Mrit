@@ -374,7 +374,141 @@ and removed from the store.
 
 ---
 
-## 11. Implementation conformance notes (Phase 5)
+## 11. BLE GATT transport bridge (Phase 6)
+
+As of Phase 5, the MMP packet format, AES-256-GCM wire format, and EC public
+key encoding are byte-for-byte identical on Android and iOS — but the two
+platforms still had no shared *physical* transport: Android uses WiFi Direct
+(WifiDirectTransport) for data and a separate BLE service only for discovery
+(BLETransport), while iOS uses MultipeerConnectivity (MultipeerTransport),
+which is iOS↔iOS only. Phase 6 adds a **BLE GATT bridge** that both platforms
+implement identically, giving every node a transport that works
+Android↔Android, iOS↔iOS, *and* Android↔iOS.
+
+This is an additional transport, not a replacement — WiFi Direct and
+MultipeerConnectivity remain the preferred (faster) links for same-platform
+peers. A node prefers a WiFi Direct/Multipeer link to a peer if one exists,
+and falls back to the BLE GATT link otherwise (§7.4 routing decisions are
+unchanged; only the "send to next hop" step gains a fallback transport).
+
+### 11.1 Roles
+
+Every MRIT node runs **both** GATT roles simultaneously:
+
+- **Peripheral (GATT server)** — advertises the Data Service UUID and hosts
+  the Data Characteristic. Accepts characteristic *writes* from centrals
+  (their data → us) and sends *notifications* to subscribed centrals
+  (our data → them).
+- **Central (GATT client)** — scans for the Data Service UUID, connects to
+  discovered peripherals, enables notifications on the Data Characteristic,
+  and sends data via characteristic *writes*.
+
+A single GATT connection between central X and peripheral Y is therefore
+bidirectional: X→Y travels as writes, Y→X travels as notifications, both on
+the same characteristic.
+
+### 11.2 UUIDs
+
+| Name | UUID | Purpose |
+|---|---|---|
+| `MRIT_GATT_SERVICE_UUID` | `4d524954-0010-1000-8000-00805f9b34fb` | Identifies the MRIT data-bridge GATT service. Distinct from `BLETransport`'s discovery-only service `4d524954-0000-...`. |
+| `MRIT_GATT_DATA_CHAR_UUID` | `4d524954-0011-1000-8000-00805f9b34fb` | The single characteristic used for all fragment traffic. Properties: `WRITE` + `NOTIFY`. Permissions: `READ` + `WRITE`. |
+| CCCD | `00002902-0000-1000-8000-00805f9b34fb` | Standard Client Characteristic Configuration Descriptor — central writes this to enable notifications. |
+
+### 11.3 Fragmentation
+
+The ATT payload per write/notification is `negotiatedMtu - 3` bytes (3 bytes
+of ATT opcode/handle overhead). The default ATT MTU is 23 (→ 20-byte
+payload); both platforms request a larger MTU (Android: `requestMtu(247)`;
+iOS negotiates automatically, typically ~185+) but **must work correctly with
+the default 20-byte payload** if negotiation doesn't improve it.
+
+Each encoded `MeshPacket` (`MMPEncoder`/`MMPCodec` output, 69–65604 bytes) is
+split into one or more fragments sent as successive writes/notifications on
+`MRIT_GATT_DATA_CHAR_UUID`:
+
+```
+byte 0        : FLAGS
+                  bit 0 (0x01) = FIRST — starts a new message
+                  bit 1 (0x02) = LAST  — completes the message
+                  bits 2-7     = reserved (0)
+[bytes 1-4]   : TOTAL_LENGTH, uint32 BE — present ONLY when FIRST is set;
+                total byte length of the encoded MeshPacket that follows
+bytes N..end  : raw slice of the encoded MeshPacket
+```
+
+- Single-fragment message: `FLAGS = 0x03` (FIRST|LAST), 5-byte header.
+- Multi-fragment message: first fragment `FLAGS = 0x01` (5-byte header,
+  carries `TOTAL_LENGTH`), middle fragments `FLAGS = 0x00` (1-byte header),
+  final fragment `FLAGS = 0x02` (1-byte header).
+- `1 <= TOTAL_LENGTH <= 65604` (`HEADER_SIZE + MAX_PAYLOAD_SIZE`). A FIRST
+  fragment outside this range, or any fragment received while no FIRST is
+  pending, is dropped and the reassembly buffer for that connection is reset.
+
+**Reassembly:** since a GATT connection is inherently 1:1, each side keeps
+exactly one reassembly buffer per connected remote device. On FIRST, reset
+the buffer and record `TOTAL_LENGTH`. Append each fragment's data bytes in
+arrival order. Once `buffer.size >= TOTAL_LENGTH` and a LAST fragment has been
+seen, decode `buffer[0..<TOTAL_LENGTH]` with `MMPDecoder`/`MMPCodec` and emit
+the resulting `MeshPacket`; ignore any extra trailing bytes.
+
+### 11.4 Connection establishment & handshake
+
+1. Central scans for `MRIT_GATT_SERVICE_UUID`, connects to a discovered
+   peripheral.
+2. Central requests a larger MTU (best-effort), discovers services, and
+   writes the CCCD on `MRIT_GATT_DATA_CHAR_UUID` to enable notifications.
+3. Once notifications are enabled, the **central sends a DISCOVER packet**
+   (`type=0x03`, `ttl=1`, payload = our 65-byte x963 public key, §5) to the
+   peripheral, fragmented per §11.3, via characteristic writes.
+4. The **peripheral responds with its own DISCOVER packet**, fragmented, via
+   notifications.
+5. Each side derives the ECDH shared key (§6) from the other's public key and
+   registers the peer:
+   - `meshId` = `srcId` of the received DISCOVER
+   - `bleAddress` = the platform connection identifier — Android:
+     `BluetoothDevice.address` of the remote device (same field on both the
+     central and peripheral side); iOS: `CBPeripheral.identifier.uuidString`
+     (central side) / `CBCentral.identifier.uuidString` (peripheral side)
+   - `ipAddress` is left unset — this peer is reachable only via BLE GATT
+
+### 11.5 Sending
+
+Once a peer is registered with a `bleAddress`, each side remembers which GATT
+role it played for that connection:
+
+- If we are the **central**: send by writing fragments to the peripheral's
+  `MRIT_GATT_DATA_CHAR_UUID`.
+- If we are the **peripheral**: send by notifying the connected central on
+  `MRIT_GATT_DATA_CHAR_UUID`.
+
+`MeshNode`'s "send to next hop" step (§7.4) tries the WiFi Direct /
+MultipeerConnectivity link first (by `ipAddress` / native peer mapping) and
+falls back to the BLE GATT link (`bleAddress`) if no such link exists.
+
+### 11.6 Known limitations (Phase 6)
+
+- **Throughput.** BLE GATT is far slower than WiFi Direct/Multipeer
+  (roughly 1–4 KB/s depending on negotiated MTU and connection interval).
+  MSG/ACK/ROUTE/SOS are small enough to be unaffected; `FILE_CHUNK` transfers
+  over a BLE-GATT-only link (e.g. Android↔iOS) will be noticeably slow. No
+  additional flow control beyond the platform GATT write queue is
+  implemented.
+- **ACK retry transport.** Android's `AckManager` retry (§9) re-resolves the
+  current transport for the destination at retry time, which may differ from
+  the transport used for the original send if the peer's link changed
+  in-between — acceptable since ACK matching is fingerprint-based and
+  idempotent.
+- iOS does not yet implement outgoing ACK retry (§9) — unrelated to Phase 6,
+  unchanged.
+
+**Reference implementations:**
+`app/src/main/java/com/mrit/mesh/transport/BleGattTransport.kt`,
+`ios/Sources/MritMesh/Transport/BleGattTransport.swift`
+
+---
+
+## 12. Implementation conformance notes (Phase 5–6)
 
 This section documents bugs found and fixed while writing this spec, so they
 are not silently reintroduced.
@@ -397,10 +531,18 @@ are not silently reintroduced.
   public key in DISCOVER as X.509 DER (~91 bytes) while iOS used 65-byte
   x963. An Android↔iOS handshake would have failed to derive a shared key.
   Both platforms now use 65-byte x963 (§5).
+- **Android `PeerRegistry.register()` clobbering (fixed, Phase 6):** the
+  table previously overwrote the entire `PeerInfo` on every `register()`
+  call. Once a peer can be reached over more than one transport, a BLE-only
+  handshake (`ipAddress=""`) registered after a WiFi Direct handshake would
+  wipe out the already-known `ipAddress` (and vice versa for `bleAddress` /
+  `publicKey`). `register()` now merges: it keeps the existing `ipAddress`,
+  `bleAddress`, and `publicKey` whenever the incoming `PeerInfo` doesn't
+  carry them.
 
 ---
 
-## 12. Versioning policy
+## 13. Versioning policy
 
 - `MMP_VERSION = 0x01` covers the header layout in §2 and all packet types
   in §3.
