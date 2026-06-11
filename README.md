@@ -147,7 +147,7 @@ after which the sender is notified the delivery failed. Implemented identically 
 
 ---
 
-## 🌉 BLE GATT Bridge <sub>· Phase 6</sub>
+## 🌉 BLE GATT Bridge <sub>· Phase 6 · hardened Phase 8</sub>
 
 MultipeerConnectivity (iOS) and WiFi Direct (Android) are different radio
 protocols and can't talk to each other directly. Bluetooth LE GATT is the
@@ -174,6 +174,11 @@ bridge — **every node runs both GATT roles at once**:
 - **Routing fallback** — `MeshNode` tries WiFi Direct/Multipeer first, falling
   back to the BLE GATT link for any peer only reachable over BLE.
 - **Throughput** — roughly 1–4 KB/s, fine for chat/SOS text.
+- **Reliability hardening · Phase 8** — capped at 4 simultaneous CENTRAL
+  connections per node (both BLE stacks degrade beyond that), automatic
+  reconnect with exponential backoff (1s → 30s) on disconnect, and on iOS,
+  CoreBluetooth state restoration so the bridge survives the app being
+  suspended/relaunched in the background.
 
 📖 See **[PROTOCOL.md §11](PROTOCOL.md)** for the full spec and known limitations.
 
@@ -318,7 +323,7 @@ ios/                            — Swift Package (Phase 4)
 | **5** | ✅ | Cross-platform protocol reconciliation: 65-byte x963 EC public keys on Android (matching iOS CryptoKit), AODV RREQ payload bugfix, iOS AES-GCM empty-plaintext decrypt fix, formal [PROTOCOL.md](PROTOCOL.md) spec, and the `Mrit` developer DSL |
 | **6** | ✅ | **BLE GATT transport bridge** for real iOS↔Android interop — `BleGattTransport` on Android (GATT central+peripheral) and Swift/CoreBluetooth on iOS, ATT-MTU fragmentation/reassembly, DISCOVER-based ECDH handshake, and transport-fallback routing (`MeshNode.transmit`) on both platforms |
 | **7** | ✅ | **iOS ACK-retry parity** — `AckManager.swift` ports Android's `AckManager.kt` (5s timeout, 3 retries, 1s check loop, SHA-256 fingerprint matching) so iOS now retries unacknowledged `MSG`s and reports delivery failure, closing the last cross-platform gap in PROTOCOL.md §9 |
-| **8** | 🔜 | Cross-platform field testing & BLE reliability hardening (connection retry/backoff, CoreBluetooth state restoration, multi-peer GATT scaling), plus mesh topology visualization in the UI |
+| **8** | 🟡 | **BLE reliability hardening** ✅ — connection retry with exponential backoff (1s→30s), a 4-link CENTRAL connection cap on both platforms, and iOS CoreBluetooth state restoration. Still 🔜: cross-platform field testing on real hardware and mesh topology visualization in the UI |
 
 ---
 

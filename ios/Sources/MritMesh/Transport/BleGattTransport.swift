@@ -22,6 +22,23 @@ private let bleMaxTotalLength = MeshPacket.headerSize + MeshPacket.maxPayloadSiz
 
 private let bleRetryDelay: TimeInterval = 0.05
 
+/// Cap on simultaneous CENTRAL-role GATT connections. Both iOS and Android
+/// BLE stacks become unreliable (connection failures, dropped notifications)
+/// with too many concurrent links — PROTOCOL.md §11.7.
+private let bleMaxCentralLinks = 4
+
+/// Exponential backoff bounds for reconnecting after a disconnect or failed
+/// connection attempt — PROTOCOL.md §11.7.
+private let bleReconnectBaseDelay: TimeInterval = 1.0
+private let bleReconnectMaxDelay:  TimeInterval = 30.0
+private let bleReconnectMaxShift  = 5 // base * 2^5 = base * 32
+
+/// CoreBluetooth state-restoration identifiers (PROTOCOL.md §11.7). The host
+/// app must declare `bluetooth-central` and `bluetooth-peripheral` in
+/// `UIBackgroundModes` (Info.plist) for restoration to take effect.
+private let bleCentralRestoreId    = "com.mrit.mesh.ble.central"
+private let blePeripheralRestoreId = "com.mrit.mesh.ble.peripheral"
+
 // MARK: - BleGattTransport
 
 /// BleGattTransport — phone-to-phone data bridge over Bluetooth LE GATT (Phase 6).
@@ -69,6 +86,9 @@ public class BleGattTransport: NSObject {
     /// Peripheral identifiers for which a `connect()` call is in flight (de-dupes scan results).
     private var connecting = Set<String>()
 
+    /// Reconnect attempt counters per peripheral identifier — drives exponential backoff.
+    private var reconnectAttempts = [String: Int]()
+
     private let lock = NSLock()
 
     // MARK: - Callbacks
@@ -85,8 +105,14 @@ public class BleGattTransport: NSObject {
         self.ourId      = ourId
         self.keyManager = keyManager
         super.init()
-        centralManager    = CBCentralManager(delegate: self, queue: nil)
-        peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
+        // Restoration identifiers let iOS relaunch us in the background to
+        // handle BLE events (PROTOCOL.md §11.7) — see `willRestoreState` below.
+        centralManager    = CBCentralManager(delegate: self, queue: nil, options: [
+            CBCentralManagerOptionRestoreIdentifierKey: bleCentralRestoreId
+        ])
+        peripheralManager = CBPeripheralManager(delegate: self, queue: nil, options: [
+            CBPeripheralManagerOptionRestoreIdentifierKey: blePeripheralRestoreId
+        ])
     }
 
     // MARK: - Lifecycle
@@ -118,6 +144,7 @@ public class BleGattTransport: NSObject {
         centralLinks.removeAll()
         serverLinks.removeAll()
         connecting.removeAll()
+        reconnectAttempts.removeAll()
         lock.unlock()
 
         toDisconnect.forEach { link in
@@ -150,6 +177,40 @@ public class BleGattTransport: NSObject {
             withServices: [bleGattServiceUUID],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
+    }
+
+    /// Schedule a reconnect attempt to `peripheral` after an exponential
+    /// backoff (PROTOCOL.md §11.7): 1s, 2s, 4s, 8s, 16s, capped at 30s. Reset
+    /// when a connection to this peripheral succeeds (`didConnect`).
+    ///
+    /// `scanForPeripherals` with `allowDuplicates: false` may never redeliver
+    /// `didDiscover` for a peer we've already seen, so reconnects are driven
+    /// directly via `centralManager.connect(peripheral:)` rather than relying
+    /// on rediscovery.
+    private func scheduleReconnect(_ peripheral: CBPeripheral) {
+        let address = peripheral.identifier.uuidString
+
+        lock.lock()
+        let attempt = (reconnectAttempts[address] ?? 0) + 1
+        reconnectAttempts[address] = attempt
+        lock.unlock()
+
+        let shift = min(attempt - 1, bleReconnectMaxShift)
+        let delay = min(bleReconnectBaseDelay * pow(2.0, Double(shift)), bleReconnectMaxDelay)
+        print("[BleGattTransport] scheduling reconnect to \(address) in \(delay)s (attempt \(attempt))")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self, self.isRunning else { return }
+
+            self.lock.lock()
+            let alreadyConnected = self.centralLinks[address] != nil
+            let atCapacity       = self.centralLinks.count >= bleMaxCentralLinks
+            if !alreadyConnected && !atCapacity { self.connecting.insert(address) }
+            self.lock.unlock()
+
+            guard !alreadyConnected, !atCapacity else { return }
+            self.centralManager.connect(peripheral, options: nil)
+        }
     }
 
     // MARK: - Sending / fragmentation
@@ -313,10 +374,11 @@ extension BleGattTransport: CBCentralManagerDelegate {
 
         lock.lock()
         let alreadyKnown = centralLinks[address] != nil || connecting.contains(address)
-        if !alreadyKnown { connecting.insert(address) }
+        let atCapacity   = centralLinks.count >= bleMaxCentralLinks
+        if !alreadyKnown && !atCapacity { connecting.insert(address) }
         lock.unlock()
 
-        guard !alreadyKnown else { return }
+        guard !alreadyKnown, !atCapacity else { return }
 
         peripheral.delegate = self
         centralManager.connect(peripheral, options: nil)
@@ -327,6 +389,7 @@ extension BleGattTransport: CBCentralManagerDelegate {
 
         lock.lock()
         connecting.remove(address)
+        reconnectAttempts.removeValue(forKey: address)
         centralLinks[address] = BleLink(address: address, role: .central, peripheral: peripheral)
         lock.unlock()
 
@@ -339,6 +402,7 @@ extension BleGattTransport: CBCentralManagerDelegate {
         connecting.remove(address)
         centralLinks.removeValue(forKey: address)
         lock.unlock()
+        scheduleReconnect(peripheral)
     }
 
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
@@ -347,6 +411,30 @@ extension BleGattTransport: CBCentralManagerDelegate {
         connecting.remove(address)
         centralLinks.removeValue(forKey: address)
         lock.unlock()
+        scheduleReconnect(peripheral)
+    }
+
+    /// CoreBluetooth state restoration (PROTOCOL.md §11.7) — re-relinks any
+    /// peripherals the system reconnected on our behalf while the app was
+    /// suspended/terminated and relaunched in the background.
+    public func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        guard let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] else { return }
+
+        for peripheral in peripherals {
+            let address = peripheral.identifier.uuidString
+            peripheral.delegate = self
+
+            lock.lock()
+            if centralLinks[address] == nil {
+                centralLinks[address] = BleLink(address: address, role: .central, peripheral: peripheral)
+            }
+            lock.unlock()
+
+            if peripheral.state == .connected {
+                peripheral.discoverServices([bleGattServiceUUID])
+            }
+        }
+        print("[BleGattTransport] Restored \(peripherals.count) central peripheral(s)")
     }
 }
 
@@ -423,6 +511,21 @@ extension BleGattTransport: CBPeripheralManagerDelegate {
         if peripheral.state == .poweredOn && isRunning {
             setupGattServerAndAdvertise()
         }
+    }
+
+    /// CoreBluetooth state restoration (PROTOCOL.md §11.7) — recover the
+    /// previously-published GATT service/characteristic so we can keep
+    /// serving subscribed centrals after the system relaunches us in the
+    /// background.
+    public func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String: Any]) {
+        guard let services = dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService] else { return }
+
+        for service in services where service.uuid == bleGattServiceUUID {
+            if let characteristic = service.characteristics?.first(where: { $0.uuid == bleGattDataCharacteristicUUID }) as? CBMutableCharacteristic {
+                dataCharacteristic = characteristic
+            }
+        }
+        print("[BleGattTransport] Restored peripheral manager state")
     }
 
     public func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {

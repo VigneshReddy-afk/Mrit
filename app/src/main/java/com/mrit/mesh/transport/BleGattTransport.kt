@@ -100,6 +100,19 @@ class BleGattTransport(
         private const val MAX_TOTAL_LENGTH = MeshPacket.HEADER_SIZE + MeshPacket.MAX_PAYLOAD_SIZE
 
         private const val RETRY_DELAY_MS = 50L
+
+        /**
+         * Cap on simultaneous CENTRAL-role GATT connections. Both Android and iOS
+         * BLE stacks become unreliable (connection failures, dropped notifications)
+         * with too many concurrent links — PROTOCOL.md §11.7.
+         */
+        private const val MAX_CENTRAL_LINKS = 4
+
+        /** Exponential backoff bounds for reconnecting after a disconnect or
+         *  failed connection attempt — PROTOCOL.md §11.7. */
+        private const val RECONNECT_BASE_DELAY_MS = 1_000L
+        private const val RECONNECT_MAX_DELAY_MS = 30_000L
+        private const val RECONNECT_MAX_SHIFT = 5 // base * 2^5 = base * 32
     }
 
     private val bluetoothManager: BluetoothManager by lazy {
@@ -123,6 +136,14 @@ class BleGattTransport(
     /** Device addresses for which a connectGatt() call is in flight (de-dupes scan results). */
     private val connecting = ConcurrentHashMap.newKeySet<String>()
 
+    /** Reconnect attempt counters per device address — drives exponential backoff. */
+    private val reconnectAttempts = ConcurrentHashMap<String, Int>()
+
+    /** Earliest [System.currentTimeMillis] at which we should (re)connect to this address. */
+    private val nextConnectAttempt = ConcurrentHashMap<String, Long>()
+
+    @Volatile private var isRunning = false
+
     /** Emits decoded data packets (non-DISCOVER) for the router. */
     private val _incomingPackets = MutableSharedFlow<MeshPacket>(extraBufferCapacity = 128)
     val incomingPackets: SharedFlow<MeshPacket> = _incomingPackets
@@ -138,6 +159,7 @@ class BleGattTransport(
             Log.e(TAG, "Bluetooth is not enabled — BLE GATT bridge unavailable")
             return
         }
+        isRunning = true
         startGattServer()
         startAdvertising()
         startScanning()
@@ -145,6 +167,8 @@ class BleGattTransport(
     }
 
     fun stop() {
+        isRunning = false
+
         try { advertiser?.stopAdvertising(advertiseCallback) } catch (_: Exception) {}
         try { scanner?.stopScan(scanCallback) } catch (_: Exception) {}
 
@@ -167,6 +191,8 @@ class BleGattTransport(
         dataCharacteristic = null
 
         connecting.clear()
+        reconnectAttempts.clear()
+        nextConnectAttempt.clear()
         scope.cancel()
         Log.d(TAG, "BleGattTransport stopped")
     }
@@ -253,6 +279,12 @@ class BleGattTransport(
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val address = result.device.address
             if (centralLinks.containsKey(address)) return
+            if (centralLinks.size >= MAX_CENTRAL_LINKS) return
+
+            val now = System.currentTimeMillis()
+            val earliest = nextConnectAttempt[address] ?: 0L
+            if (now < earliest) return // still backing off from a recent failure
+
             if (!connecting.add(address)) return
 
             Log.d(TAG, "BLE GATT peer discovered: $address — connecting")
@@ -261,6 +293,34 @@ class BleGattTransport(
 
         override fun onScanFailed(errorCode: Int) {
             Log.e(TAG, "BLE GATT bridge scan failed, errorCode=$errorCode")
+        }
+    }
+
+    /**
+     * Schedule a reconnect attempt to [device] after an exponential backoff
+     * (PROTOCOL.md §11.7): 1s, 2s, 4s, 8s, 16s, capped at 30s. Resets when a
+     * connection to this address succeeds (see [centralCallback]).
+     *
+     * Continuous scanning would otherwise re-trigger `connectGatt()` on every
+     * scan result for a peer that just dropped, which can overwhelm the BLE
+     * stack (Android GATT status 133) when a peer is repeatedly unreachable.
+     */
+    private fun scheduleReconnect(device: BluetoothDevice) {
+        val address = device.address
+        val attempt = (reconnectAttempts[address] ?: 0) + 1
+        reconnectAttempts[address] = attempt
+        val shift = (attempt - 1).coerceAtMost(RECONNECT_MAX_SHIFT)
+        val delayMs = (RECONNECT_BASE_DELAY_MS shl shift).coerceAtMost(RECONNECT_MAX_DELAY_MS)
+        nextConnectAttempt[address] = System.currentTimeMillis() + delayMs
+
+        Log.d(TAG, "Central: reconnect to $address in ${delayMs}ms (attempt $attempt)")
+        scope.launch {
+            delay(delayMs)
+            if (!isRunning) return@launch
+            if (centralLinks.containsKey(address)) return@launch
+            if (centralLinks.size >= MAX_CENTRAL_LINKS) return@launch
+            if (!connecting.add(address)) return@launch
+            device.connectGatt(context, false, centralCallback)
         }
     }
 
@@ -273,6 +333,8 @@ class BleGattTransport(
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     connecting.remove(address)
+                    reconnectAttempts.remove(address)
+                    nextConnectAttempt.remove(address)
                     centralLinks[address] = Link(address = address, role = Role.CENTRAL, gatt = gatt, device = gatt.device)
                     Log.d(TAG, "Central: connected to $address")
                     gatt.requestMtu(REQUESTED_MTU)
@@ -282,6 +344,7 @@ class BleGattTransport(
                     centralLinks.remove(address)
                     try { gatt.close() } catch (_: Exception) {}
                     Log.d(TAG, "Central: disconnected from $address (status=$status)")
+                    scheduleReconnect(gatt.device)
                 }
             }
         }

@@ -503,6 +503,50 @@ falls back to the BLE GATT link (`bleAddress`) if no such link exists.
   in-between — acceptable since ACK matching is fingerprint-based and
   idempotent.
 
+### 11.7 Connection reliability hardening (Phase 8)
+
+A BLE GATT link can drop at any time — radio interference, the peer walking
+out of range, or either OS's Bluetooth stack hiccuping. Phase 8 hardens both
+platforms' CENTRAL-role connection handling against this:
+
+- **Connection cap.** Each node caps simultaneous CENTRAL-role GATT
+  connections at `MAX_CENTRAL_LINKS = 4` (`MAX_CENTRAL_LINKS` /
+  `bleMaxCentralLinks`). Both platforms' BLE stacks become unreliable —
+  connection failures, dropped notifications, degraded throughput — with too
+  many concurrent links. New scan results / discoveries are ignored while at
+  capacity; a slot frees up as soon as a link disconnects.
+- **Reconnect backoff.** On disconnect or a failed connection attempt, each
+  node schedules a reconnect to that *same* peer with exponential backoff:
+  1s, 2s, 4s, 8s, 16s, capped at 30s (`RECONNECT_BASE_DELAY_MS` /
+  `RECONNECT_MAX_DELAY_MS`, `bleReconnectBaseDelay` / `bleReconnectMaxDelay`).
+  The backoff counter resets to zero as soon as a connection to that peer
+  succeeds. Without this, continuous scanning would otherwise re-trigger a
+  connection attempt on every scan result for a peer that just dropped,
+  which can overwhelm the BLE stack (e.g. Android GATT status 133) when a
+  peer is repeatedly unreachable.
+  - Android: the scan callback also checks a per-address "earliest retry
+    time" so scan-driven connects respect the same backoff.
+  - iOS: `scanForPeripherals` is started with
+    `CBCentralManagerScanOptionAllowDuplicatesKey: false`, so `didDiscover`
+    may never fire again for an already-seen peripheral. Reconnects are
+    therefore driven directly via `centralManager.connect(peripheral:)`
+    using the `CBPeripheral` reference passed to
+    `didDisconnectPeripheral`/`didFailToConnect`, not by waiting for
+    rediscovery.
+- **CoreBluetooth state restoration (iOS only).** `CBCentralManager` and
+  `CBPeripheralManager` are created with
+  `CBCentralManagerOptionRestoreIdentifierKey` /
+  `CBPeripheralManagerOptionRestoreIdentifierKey`
+  (`com.mrit.mesh.ble.central` / `com.mrit.mesh.ble.peripheral`). If iOS
+  relaunches the app in the background to handle a BLE event,
+  `centralManager(_:willRestoreState:)` re-links any peripherals the system
+  reconnected on our behalf and resumes service discovery, and
+  `peripheralManager(_:willRestoreState:)` recovers the previously-published
+  GATT service/characteristic. **Host app requirement:** declare
+  `bluetooth-central` and `bluetooth-peripheral` in `UIBackgroundModes`
+  (Info.plist) for restoration to take effect — this is a host-app
+  packaging concern, outside the `MritMesh` Swift package itself.
+
 **Reference implementations:**
 `app/src/main/java/com/mrit/mesh/transport/BleGattTransport.kt`,
 `ios/Sources/MritMesh/Transport/BleGattTransport.swift`
