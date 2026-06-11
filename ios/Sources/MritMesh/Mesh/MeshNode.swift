@@ -32,6 +32,7 @@ public class MeshNode {
     private let lock            = NSLock()
 
     private var fileManager:    FileTransferManager!
+    private var ackManager:     AckManager!
 
     // ── Callbacks ──────────────────────────────────────────────────────────────
 
@@ -49,6 +50,20 @@ public class MeshNode {
             ourId:    ourId,
             sendPacket: { [weak self] packet, dest in self?.dispatchPacket(packet, to: dest) },
             onFileReceived: { [weak self] name, data in self?.onFileReceived?(name, data) }
+        )
+        self.ackManager = AckManager(
+            onRetry: { [weak self] packet, _ in
+                self?.transmit(packet, to: packet.dstId)
+            },
+            onDeliveryFailed: { [weak self] packet in
+                guard let self = self else { return }
+                print("[MeshNode] Delivery failed for packet to \(packet.dstId.shortId)")
+                self.onMessageReceived?(IncomingMessage(
+                    from:  self.ourId,
+                    text:  "⚠️ Message to \(packet.dstId.shortId) failed after 3 retries",
+                    isSOS: false
+                ))
+            }
         )
         wireTransport()
     }
@@ -98,6 +113,9 @@ public class MeshNode {
             return
         }
         if transmit(packet, to: dest) {
+            if packet.type == .msg {
+                trackForAck(packet, dest: dest)
+            }
             return
         }
         // No route yet — store and broadcast RREQ
@@ -105,6 +123,16 @@ public class MeshNode {
         packetStore[dest.hexString, default: []].append(packet)
         lock.unlock()
         broadcastRREQ(for: dest)
+    }
+
+    /// Register an outgoing `MSG` packet with the `AckManager` so it gets
+    /// retried (up to 3x, 5s timeout) if no `ACK` arrives — PROTOCOL.md §9.
+    private func trackForAck(_ packet: MeshPacket, dest: MeshID) {
+        lock.lock()
+        let entry = peerRegistry[dest.hexString]
+        lock.unlock()
+        let address = entry?.hasMultipeerLink == true ? "multipeer" : (entry?.bleAddress ?? "")
+        ackManager.trackOutgoing(packet, address: address)
     }
 
     private func route(_ packet: MeshPacket) {
@@ -175,8 +203,9 @@ public class MeshNode {
             sendAck(for: packet)
 
         case .ack:
-            // ACK received — delivery confirmed (AckManager in Phase 5)
-            break
+            if let payload = String(data: packet.payload, encoding: .utf8) {
+                ackManager.acknowledge(payload)
+            }
 
         case .sos:
             let text = String(data: packet.payload, encoding: .utf8) ?? "<sos>"
@@ -197,14 +226,9 @@ public class MeshNode {
     // ── ACK ────────────────────────────────────────────────────────────────────
 
     private func sendAck(for original: MeshPacket) {
-        let fp      = MeshCrypto.packetFingerprint(
-            srcBytes: original.srcId.bytes,
-            dstBytes: original.dstId.bytes,
-            payload:  original.payload
-        )
         let ack = MeshPacket(
             type: .ack, srcId: ourId, dstId: original.srcId,
-            payload: Data("ACK:\(fp)".utf8)
+            payload: ackManager.buildAckPayload(for: original)
         )
         transmit(ack, to: original.srcId)
     }

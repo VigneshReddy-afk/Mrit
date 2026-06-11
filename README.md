@@ -8,7 +8,7 @@
 [![Android](https://img.shields.io/badge/Android-Kotlin-7F52FF?style=flat-square&logo=kotlin&logoColor=white)](#-project-structure)
 [![iOS](https://img.shields.io/badge/iOS-Swift-FA7343?style=flat-square&logo=swift&logoColor=white)](#-project-structure)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
-[![Phase](https://img.shields.io/badge/phase-6%20of%207-orange?style=flat-square)](#️-roadmap)
+[![Phase](https://img.shields.io/badge/phase-7%20of%208-orange?style=flat-square)](#️-roadmap)
 [![Spec](https://img.shields.io/badge/protocol-MMP%20v1-informational?style=flat-square)](PROTOCOL.md)
 
 MRIT is a **from-scratch mesh networking stack** for Android and iOS that lets phones
@@ -127,10 +127,12 @@ Routes expire after **30 seconds** to handle device movement.
 
 ---
 
-## ✅ Reliability — ACK + Retry <sub>· Phase 3</sub>
+## ✅ Reliability — ACK + Retry <sub>· Phase 3 · iOS parity Phase 7</sub>
 
 Every delivered `MSG` triggers an `ACK` packet back to the sender.
-If the `ACK` isn't received within **5 seconds**, the message is re-sent — up to **3 attempts**.
+If the `ACK` isn't received within **5 seconds**, the message is re-sent — up to **3 attempts**,
+after which the sender is notified the delivery failed. Implemented identically by
+`AckManager.kt` (Android) and `AckManager.swift` (iOS), matched by SHA-256 packet fingerprint.
 
 ---
 
@@ -295,6 +297,8 @@ ios/                            — Swift Package (Phase 4)
     ├── Mesh/
     │   ├── MeshNode.swift      — iOS public API (sendMessage/sendFile/sendSOS)
     │   └── FileTransferManager.swift — chunked file transfer, binary-compatible payloads
+    ├── Reliability/
+    │   └── AckManager.swift    — ACK tracking + 3-retry logic, ports Android's AckManager (Phase 7)
     └── DSL/
         └── Mrit.swift          — high-level Mrit DSL: send/sendFile/sos + onMessage/onFile/onPeers (Phase 5)
 ```
@@ -313,7 +317,8 @@ ios/                            — Swift Package (Phase 4)
 | **4** | ✅ | iOS Swift Package (9 files, binary-compatible), Android Keystore key storage, encrypted 32KB chunked file transfer, 11-test crypto suite |
 | **5** | ✅ | Cross-platform protocol reconciliation: 65-byte x963 EC public keys on Android (matching iOS CryptoKit), AODV RREQ payload bugfix, iOS AES-GCM empty-plaintext decrypt fix, formal [PROTOCOL.md](PROTOCOL.md) spec, and the `Mrit` developer DSL |
 | **6** | ✅ | **BLE GATT transport bridge** for real iOS↔Android interop — `BleGattTransport` on Android (GATT central+peripheral) and Swift/CoreBluetooth on iOS, ATT-MTU fragmentation/reassembly, DISCOVER-based ECDH handshake, and transport-fallback routing (`MeshNode.transmit`) on both platforms |
-| **7** | 🔜 | Cross-platform field testing & BLE reliability hardening (connection retry/backoff, CoreBluetooth state restoration, multi-peer GATT scaling), plus mesh topology visualization in the UI |
+| **7** | ✅ | **iOS ACK-retry parity** — `AckManager.swift` ports Android's `AckManager.kt` (5s timeout, 3 retries, 1s check loop, SHA-256 fingerprint matching) so iOS now retries unacknowledged `MSG`s and reports delivery failure, closing the last cross-platform gap in PROTOCOL.md §9 |
+| **8** | 🔜 | Cross-platform field testing & BLE reliability hardening (connection retry/backoff, CoreBluetooth state restoration, multi-peer GATT scaling), plus mesh topology visualization in the UI |
 
 ---
 

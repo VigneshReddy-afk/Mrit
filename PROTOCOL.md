@@ -356,9 +356,11 @@ tracked by the sender:
   packet is abandoned and the sender is notified of delivery failure.
 - A retry checker runs every `CHECK_INTERVAL = 1000` ms.
 
-**Reference implementation:** `app/src/main/java/com/mrit/mesh/reliability/AckManager.kt`
-(iOS port tracked for a future phase — currently iOS receives and answers
-ACKs but does not yet retry its own outgoing MSGs.)
+**Reference implementations:**
+`app/src/main/java/com/mrit/mesh/reliability/AckManager.kt`,
+`ios/Sources/MritMesh/Reliability/AckManager.swift` (Phase 7 — full
+ACK-retry parity with Android: 5s timeout, 3 retries, 1s check interval,
+fingerprint-based matching via `MeshCrypto.packetFingerprint`).
 
 ---
 
@@ -494,13 +496,12 @@ falls back to the BLE GATT link (`bleAddress`) if no such link exists.
   over a BLE-GATT-only link (e.g. Android↔iOS) will be noticeably slow. No
   additional flow control beyond the platform GATT write queue is
   implemented.
-- **ACK retry transport.** Android's `AckManager` retry (§9) re-resolves the
-  current transport for the destination at retry time, which may differ from
-  the transport used for the original send if the peer's link changed
+- **ACK retry transport.** Both `AckManager` implementations (§9) re-resolve
+  the current transport for the destination at retry time (Android via
+  `transmit`, iOS via `MeshNode.transmit`), which may differ from the
+  transport used for the original send if the peer's link changed
   in-between — acceptable since ACK matching is fingerprint-based and
   idempotent.
-- iOS does not yet implement outgoing ACK retry (§9) — unrelated to Phase 6,
-  unchanged.
 
 **Reference implementations:**
 `app/src/main/java/com/mrit/mesh/transport/BleGattTransport.kt`,
@@ -508,7 +509,7 @@ falls back to the BLE GATT link (`bleAddress`) if no such link exists.
 
 ---
 
-## 12. Implementation conformance notes (Phase 5–6)
+## 12. Implementation conformance notes (Phase 5–7)
 
 This section documents bugs found and fixed while writing this spec, so they
 are not silently reintroduced.
@@ -539,6 +540,16 @@ are not silently reintroduced.
   `publicKey`). `register()` now merges: it keeps the existing `ipAddress`,
   `bleAddress`, and `publicKey` whenever the incoming `PeerInfo` doesn't
   carry them.
+- **iOS outgoing ACK retry (added, Phase 7):** iOS previously answered
+  incoming `MSG`s with an `ACK` but never tracked or retried its own
+  outgoing `MSG`s, leaving §9 ("ACK + retry") unimplemented on iOS. Added
+  `ios/Sources/MritMesh/Reliability/AckManager.swift`, a port of Android's
+  `AckManager.kt` (same 5s timeout / 3 retries / 1s check interval /
+  fingerprint matching, using a background `DispatchQueue` retry loop instead
+  of a `CoroutineScope`). Wired into `MeshNode.swift`: `dispatchPacket` calls
+  `trackOutgoing` for locally-originated `MSG`s, `deliverToApp`'s `.ack` case
+  calls `acknowledge`, and `sendAck` now builds its payload via
+  `ackManager.buildAckPayload`.
 
 ---
 
