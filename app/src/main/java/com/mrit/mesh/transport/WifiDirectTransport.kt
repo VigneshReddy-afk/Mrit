@@ -136,16 +136,16 @@ class WifiDirectTransport(
 
     private fun discoverPeers() {
         manager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() = Log.d(TAG, "Peer discovery started")
-            override fun onFailure(reason: Int) = Log.w(TAG, "Peer discovery failed, reason=$reason")
+            override fun onSuccess() { Log.d(TAG, "Peer discovery started") }
+            override fun onFailure(reason: Int) { Log.w(TAG, "Peer discovery failed, reason=$reason") }
         })
     }
 
     fun connectToPeer(deviceAddress: String) {
         val config = WifiP2pConfig().apply { this.deviceAddress = deviceAddress }
         manager.connect(channel, config, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() = Log.d(TAG, "Connect initiated to $deviceAddress")
-            override fun onFailure(reason: Int) = Log.w(TAG, "Connect to $deviceAddress failed, reason=$reason")
+            override fun onSuccess() { Log.d(TAG, "Connect initiated to $deviceAddress") }
+            override fun onFailure(reason: Int) { Log.w(TAG, "Connect to $deviceAddress failed, reason=$reason") }
         })
     }
 
