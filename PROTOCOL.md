@@ -305,6 +305,28 @@ For every received packet, a node decides one of:
 `app/src/main/java/com/mrit/mesh/mesh/MeshNode.kt` (`handleRREQ`/`handleRREP`),
 `ios/Sources/MritMesh/Mesh/MeshNode.swift` (`handleRREQ`/`handleRREP`)
 
+### 7.5 Topology snapshot (Phase 8 — Android)
+
+`AODVRouter` exposes a live `StateFlow<List<RouteSnapshot>>` (`routes`), where each
+`RouteSnapshot(destination, nextHop)` mirrors one active (non-expired) entry in the
+routing table (§7.1). A direct (1-hop) neighbor has `destination == nextHop`; a
+multi-hop destination has `nextHop` pointing at the directly-connected peer that
+relays for it.
+
+`MeshNode.routes` forwards this flow to the UI. `MainActivity` combines it with
+`MeshNode.peers` (the 1-hop peer list) and feeds both into `TopologyView`, a custom
+`Canvas`-drawn view that renders:
+- our node at the center
+- direct peers on an inner ring, each linked to the center with a solid line
+- multi-hop destinations on an outer ring, each linked with a dashed line to the
+  direct peer that relays for it
+
+This is a local, device-side visualization only — no new wire-format messages are
+introduced; it is purely a read-only projection of the existing routing table.
+
+**Reference implementation:**
+`app/src/main/java/com/mrit/mesh/ui/TopologyView.kt`
+
 ---
 
 ## 8. File transfer (FILE_CHUNK)

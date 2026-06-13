@@ -17,6 +17,7 @@ import com.mrit.mesh.mesh.MeshNode
 import com.mrit.mesh.service.MeshService
 import com.mrit.mesh.ui.MessageAdapter
 import com.mrit.mesh.ui.PeerAdapter
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 /**
@@ -133,6 +134,14 @@ class MainActivity : AppCompatActivity() {
                 messageAdapter.add(msg)
                 binding.rvMessages.scrollToPosition(messageAdapter.itemCount - 1)
             }
+        }
+
+        // Observe mesh topology (direct peers + multi-hop routes)
+        lifecycleScope.launch {
+            combine(node.peers, node.routes) { peerList, routeList -> peerList to routeList }
+                .collect { (peerList, routeList) ->
+                    binding.topologyView.setData(node.ourId.shortId(), peerList, routeList)
+                }
         }
     }
 

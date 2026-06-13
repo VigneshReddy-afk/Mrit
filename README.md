@@ -8,7 +8,7 @@
 [![Android](https://img.shields.io/badge/Android-Kotlin-7F52FF?style=flat-square&logo=kotlin&logoColor=white)](#-project-structure)
 [![iOS](https://img.shields.io/badge/iOS-Swift-FA7343?style=flat-square&logo=swift&logoColor=white)](#-project-structure)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
-[![Phase](https://img.shields.io/badge/phase-7%20of%208-orange?style=flat-square)](#️-roadmap)
+[![Phase](https://img.shields.io/badge/phase-8%20of%208-brightgreen?style=flat-square)](#️-roadmap)
 [![Spec](https://img.shields.io/badge/protocol-MMP%20v1-informational?style=flat-square)](PROTOCOL.md)
 
 MRIT is a **from-scratch mesh networking stack** for Android and iOS that lets phones
@@ -124,6 +124,17 @@ A ◀──RREP── B ◀──RREP── C
 A ──MSG───▶ B ──MSG───▶ C   (route now known)
 ```
 Routes expire after **30 seconds** to handle device movement.
+
+---
+
+## 🕸️ Mesh Topology Visualization <sub>· Phase 8</sub>
+
+The Android app renders a live radial graph of the mesh: your node sits at the
+center, directly-connected peers form an inner ring (solid lines), and multi-hop
+destinations known via AODV routes form an outer ring, each linked with a dashed
+line to the peer relaying for it. Powered by `AODVRouter.routes` —
+a `StateFlow<List<RouteSnapshot>>` — combined with the existing peer list and
+drawn by a custom `TopologyView`.
 
 ---
 
@@ -282,7 +293,8 @@ app/src/main/java/com/mrit/mesh/
 │   └── MeshService.kt          — foreground service lifecycle
 ├── ui/
 │   ├── PeerAdapter.kt          — live peer chip list
-│   └── MessageAdapter.kt       — message log
+│   ├── MessageAdapter.kt       — message log
+│   └── TopologyView.kt         — Canvas-drawn mesh topology graph (Phase 8)
 └── MainActivity.kt             — entry point, permissions, messaging UI
 
 ios/                            — Swift Package (Phase 4)
@@ -323,7 +335,7 @@ ios/                            — Swift Package (Phase 4)
 | **5** | ✅ | Cross-platform protocol reconciliation: 65-byte x963 EC public keys on Android (matching iOS CryptoKit), AODV RREQ payload bugfix, iOS AES-GCM empty-plaintext decrypt fix, formal [PROTOCOL.md](PROTOCOL.md) spec, and the `Mrit` developer DSL |
 | **6** | ✅ | **BLE GATT transport bridge** for real iOS↔Android interop — `BleGattTransport` on Android (GATT central+peripheral) and Swift/CoreBluetooth on iOS, ATT-MTU fragmentation/reassembly, DISCOVER-based ECDH handshake, and transport-fallback routing (`MeshNode.transmit`) on both platforms |
 | **7** | ✅ | **iOS ACK-retry parity** — `AckManager.swift` ports Android's `AckManager.kt` (5s timeout, 3 retries, 1s check loop, SHA-256 fingerprint matching) so iOS now retries unacknowledged `MSG`s and reports delivery failure, closing the last cross-platform gap in PROTOCOL.md §9 |
-| **8** | 🟡 | **BLE reliability hardening** ✅ — connection retry with exponential backoff (1s→30s), a 4-link CENTRAL connection cap on both platforms, and iOS CoreBluetooth state restoration. Still 🔜: cross-platform field testing on real hardware and mesh topology visualization in the UI |
+| **8** | ✅ | **BLE reliability hardening** — connection retry with exponential backoff (1s→30s), a 4-link CENTRAL connection cap on both platforms, and iOS CoreBluetooth state restoration. **Mesh topology visualization** — live radial graph of direct + multi-hop peers (`TopologyView`, Android). Outstanding: cross-platform field testing on real hardware (manual, hardware-dependent) |
 
 ---
 

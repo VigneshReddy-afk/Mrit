@@ -8,6 +8,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * AODVRouter — Ad-hoc On-Demand Distance Vector routing for the MRIT mesh.
@@ -41,6 +44,13 @@ class AODVRouter(private val ourId: MeshID) {
 
     /** Seen RREQ unique IDs — prevents re-broadcasting the same request (loop prevention) */
     private val seenRequests = LinkedHashSet<String>()
+
+    private val lock = Any()
+
+    private val _routes = MutableStateFlow<List<RouteSnapshot>>(emptyList())
+
+    /** Live snapshot of all active routes — used by the UI for mesh topology visualization. */
+    val routes: StateFlow<List<RouteSnapshot>> = _routes.asStateFlow()
 
     private val scope = CoroutineScope(Dispatchers.Default)
 
@@ -83,12 +93,13 @@ class AODVRouter(private val ourId: MeshID) {
      * Look up the next hop toward [destination].
      * Returns null if no route is known (or if the route has expired).
      */
-    fun getNextHop(destination: MeshID): MeshID? {
-        val entry = routingTable[destination] ?: return null
-        return if (System.currentTimeMillis() <= entry.expiryTime) {
+    fun getNextHop(destination: MeshID): MeshID? = synchronized(lock) {
+        val entry = routingTable[destination] ?: return@synchronized null
+        if (System.currentTimeMillis() <= entry.expiryTime) {
             entry.nextHop
         } else {
             routingTable.remove(destination)
+            publishRoutes()
             null
         }
     }
@@ -98,8 +109,11 @@ class AODVRouter(private val ourId: MeshID) {
      * Called when an RREP arrives, or when we receive any packet from a known source.
      */
     fun recordRoute(destination: MeshID, nextHop: MeshID) {
-        val expiresAt = System.currentTimeMillis() + ROUTE_EXPIRY_MS
-        routingTable[destination] = RouteEntry(nextHop, expiresAt)
+        synchronized(lock) {
+            val expiresAt = System.currentTimeMillis() + ROUTE_EXPIRY_MS
+            routingTable[destination] = RouteEntry(nextHop, expiresAt)
+            publishRoutes()
+        }
         Log.d(TAG, "Route: ${destination.shortId()} via ${nextHop.shortId()} (expires in ${ROUTE_EXPIRY_MS / 1000}s)")
     }
 
@@ -143,7 +157,9 @@ class AODVRouter(private val ourId: MeshID) {
     }
 
     /** Total number of active (non-expired) routes */
-    fun routeCount(): Int = routingTable.count { (_, v) -> System.currentTimeMillis() <= v.expiryTime }
+    fun routeCount(): Int = synchronized(lock) {
+        routingTable.count { (_, v) -> System.currentTimeMillis() <= v.expiryTime }
+    }
 
     // ── Maintenance ────────────────────────────────────────────────────────────
 
@@ -152,16 +168,29 @@ class AODVRouter(private val ourId: MeshID) {
         scope.launch {
             while (true) {
                 delay(CLEANUP_INTERVAL_MS)
-                val now = System.currentTimeMillis()
-                val expired = routingTable.entries
-                    .filter { it.value.expiryTime < now }
-                    .map { it.key }
-                expired.forEach { routingTable.remove(it) }
-                if (expired.isNotEmpty()) {
-                    Log.d(TAG, "Purged ${expired.size} expired routes — ${routeCount()} routes remaining")
+                var purgedCount = 0
+                synchronized(lock) {
+                    val now = System.currentTimeMillis()
+                    val expired = routingTable.entries
+                        .filter { it.value.expiryTime < now }
+                        .map { it.key }
+                    expired.forEach { routingTable.remove(it) }
+                    purgedCount = expired.size
+                    if (purgedCount > 0) publishRoutes()
+                }
+                if (purgedCount > 0) {
+                    Log.d(TAG, "Purged $purgedCount expired routes — ${routeCount()} routes remaining")
                 }
             }
         }
+    }
+
+    /** Must be called while holding [lock] — publishes the current active route set for the UI. */
+    private fun publishRoutes() {
+        val now = System.currentTimeMillis()
+        _routes.value = routingTable
+            .filter { (_, entry) -> entry.expiryTime >= now }
+            .map { (destination, entry) -> RouteSnapshot(destination, entry.nextHop) }
     }
 
     // ── Data models ────────────────────────────────────────────────────────────
@@ -169,6 +198,18 @@ class AODVRouter(private val ourId: MeshID) {
     data class RouteEntry(
         val nextHop: MeshID,
         val expiryTime: Long          // System.currentTimeMillis() + ROUTE_EXPIRY_MS
+    )
+
+    /**
+     * A single active route, for UI display (mesh topology visualization).
+     *
+     * @param destination the node this route leads to
+     * @param nextHop     the directly-connected peer this is reached through —
+     *                     equal to [destination] for a direct (1-hop) link
+     */
+    data class RouteSnapshot(
+        val destination: MeshID,
+        val nextHop: MeshID
     )
 }
 

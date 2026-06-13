@@ -41,6 +41,7 @@ import kotlinx.coroutines.flow.StateFlow
  *   node.incomingMessages                   — Flow<IncomingMessage>
  *   node.incomingFiles                      — Flow<ReceivedFile>
  *   node.peers                              — StateFlow<List<PeerInfo>>
+ *   node.routes                             — StateFlow<List<AODVRouter.RouteSnapshot>>
  */
 class MeshNode(private val context: Context) {
 
@@ -99,6 +100,9 @@ class MeshNode(private val context: Context) {
     val incomingFiles: SharedFlow<ReceivedFile> = _incomingFiles
 
     val peers: StateFlow<List<PeerInfo>> = peerRegistry.peers
+
+    /** Live snapshot of all known routes (direct + multi-hop) — for topology visualization. */
+    val routes: StateFlow<List<AODVRouter.RouteSnapshot>> = router.routes
 
     // ── Lifecycle ──────────────────────────────────────────────────────────────
 

@@ -82,6 +82,29 @@
         android:background="#1A1A1A"
         android:layout_marginTop="8dp" />
 
+    <!-- ── Topology section ──────────────────────────────────────── -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="20dp"
+        android:paddingTop="12dp"
+        android:paddingBottom="6dp"
+        android:text="TOPOLOGY"
+        android:textSize="10sp"
+        android:textColor="#444444"
+        android:letterSpacing="0.2" />
+
+    <com.mrit.mesh.ui.TopologyView
+        android:id="@+id/topologyView"
+        android:layout_width="match_parent"
+        android:layout_height="160dp" />
+
+    <!-- ── Divider ─────────────────────────────────────────────────── -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="#1A1A1A" />
+
     <!-- ── Messages section ───────────────────────────────────────── -->
     <TextView
         android:layout_width="match_parent"
