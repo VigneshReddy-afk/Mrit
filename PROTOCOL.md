@@ -619,7 +619,110 @@ are not silently reintroduced.
 
 ---
 
-## 13. Versioning policy
+## 13. Relay network — gateway nodes (Phase 9)
+
+§1 states "no infrastructure" as a design goal — the mesh **must** continue
+to work with zero relays, and every feature in §1-§12 is unaffected by this
+section. The relay is an **optional, additive fallback**: a node with
+internet access can reach any other internet-connected node directly,
+regardless of physical distance, for the cases where local radio range
+(§11: ~10-200m per hop) isn't enough.
+
+### 13.1 Threat/trust model
+
+The relay server is **untrusted**. It is a dumb forwarder that never sees
+plaintext:
+
+- All `MSG`/`ACK` payloads remain end-to-end encrypted (§6) — the relay
+  cannot read them.
+- MeshIDs are self-certifying (§4: derived from an EC public key) — a relay
+  operator cannot impersonate a node's identity to *decrypt* its traffic,
+  only at most disrupt delivery to a MeshID by registering it themselves
+  (denial of service for that one ID, not a confidentiality or integrity
+  break).
+- `SOS` (§3.5) is intentionally unencrypted at the local-mesh level already;
+  relaying it doesn't change its exposure.
+
+### 13.2 Frame format
+
+Every relay WebSocket connection exchanges **binary** messages, each
+prefixed with a 1-byte frame type:
+
+```
+REGISTER : [0x00][MeshID — 32 bytes]
+PACKET   : [0x01][MMP-encoded MeshPacket — 69+N bytes, §2]
+```
+
+- **REGISTER** — sent once, immediately after the WebSocket opens. Tells the
+  relay "deliver packets addressed to this MeshID to me." A node may
+  re-register at any time (e.g. after reconnecting); the relay's registry
+  entry for that MeshID is overwritten to point at the new connection.
+- **PACKET** — an MMP packet (§2), forwarded verbatim. The relay reads only
+  `DST_ID` (MMP offset `[34..65]`, i.e. frame offset `[35..66]`) to choose
+  where to forward; it does not decode `TYPE`, `TTL`, or `PAYLOAD`.
+
+### 13.3 Forwarding semantics
+
+- The relay maintains an in-memory map of `MeshID -> connection`.
+- On a PACKET frame, the relay looks up `DST_ID` in the map:
+  - **Found, connection open** — forward the frame byte-for-byte to that
+    connection.
+  - **Not found, or destination disconnected** — drop the frame silently
+    (PROTOCOL.md §1: "fail closed, fail silent"). The sender's existing
+    `AckManager` (§9) retry/timeout handles this the same as any other
+    delivery failure.
+- `MeshID.BROADCAST` (§4) is **never** sent to the relay — broadcasts
+  (group chat, `SOS`) remain local-mesh-only in this phase.
+- No store-and-forward at the relay layer (contrast with §10, which is
+  local-mesh only): if the destination isn't currently connected to *a*
+  relay, the packet is dropped immediately.
+
+### 13.4 Client behavior (`RelayTransport`, `transmitOrRelay`)
+
+`MeshNode` tries local delivery first, exactly as in §11 (WiFi Direct, then
+BLE GATT). Only if **no local route exists** does it fall back to the relay:
+
+1. `transmit()` — unchanged from §11, tries WiFi Direct then BLE GATT via
+   `PeerRegistry`.
+2. `transmitOrRelay()` — if (1) fails and `dstId != BROADCAST`, send the
+   packet (still fully encrypted) as a PACKET frame to the relay.
+3. Used for: outgoing `MSG`/`SOS`-targeted-unicast sends (`dispatchPacket`),
+   `ACK` replies (`sendAck`), and `AckManager` retries — so a reply to a
+   message that arrived via relay is also sent back via relay.
+
+Inbound packets from the relay are, by construction, always addressed to the
+receiving node's own MeshID (the relay only forwards to the registered
+`DST_ID`), so they're delivered directly to the application layer —
+AODV (§7) is not involved, since the sender isn't a local mesh peer.
+
+### 13.5 Reconnection
+
+`RelayTransport` reconnects with the same exponential backoff as the BLE GATT
+bridge (§11.7): 1s, 2s, 4s, 8s, 16s, capped at 30s. If no relay server is
+configured/reachable, the transport simply never connects and every other
+part of the mesh is unaffected.
+
+### 13.6 Server reference implementation
+
+`relay/server.js` (Node.js + `ws`) implements §13.2-§13.3 in ~50 lines.
+See `relay/README.md` for deployment notes.
+
+### 13.7 Known limitations / future work
+
+- **No gateway-on-behalf-of-peer.** Each node registers only its *own*
+  MeshID. A phone with internet cannot yet act as a relay gateway for mesh
+  peers near it that have no internet of their own — that requires the
+  gateway to advertise routes for those MeshIDs to the relay, a larger
+  protocol addition left for a future phase.
+- **No relay-side store-and-forward** (§13.3) — both ends must be
+  simultaneously connected to a relay (not necessarily the *same* one once
+  multi-relay federation exists, but v1 assumes one relay).
+- **No authentication on REGISTER** — see §13.1 for why this is an
+  availability concern only, not a confidentiality/integrity one.
+
+---
+
+## 14. Versioning policy
 
 - `MMP_VERSION = 0x01` covers the header layout in §2 and all packet types
   in §3.

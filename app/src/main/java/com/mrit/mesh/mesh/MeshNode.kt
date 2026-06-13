@@ -16,6 +16,7 @@ import com.mrit.mesh.routing.RoutingDecision
 import com.mrit.mesh.storage.PacketStore
 import com.mrit.mesh.transport.BLETransport
 import com.mrit.mesh.transport.BleGattTransport
+import com.mrit.mesh.transport.RelayTransport
 import com.mrit.mesh.transport.WifiDirectTransport
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -33,6 +34,13 @@ import kotlinx.coroutines.flow.StateFlow
  *                              Secure Enclave devices)
  *   - iOS counterpart        : Swift Package at ios/ with binary-compatible MMP codec,
  *                              CryptoKit-based crypto, MultipeerConnectivity transport
+ *
+ * Phase 9:
+ *   - Relay/gateway transport : when no local route to a destination exists,
+ *                              [RelayTransport] forwards the (still end-to-end
+ *                              encrypted) packet over the internet via a relay
+ *                              server — see PROTOCOL.md §14. Local mesh delivery
+ *                              is always tried first; the relay is a fallback.
  *
  * Public API:
  *   node.sendMessage(to, text)              — unicast encrypted message
@@ -65,6 +73,7 @@ class MeshNode(private val context: Context) {
     private val bleTransport  = BLETransport(context, ourId)
     private val bleGattTransport = BleGattTransport(context, ourId, keyManager)
     private val wifiTransport = WifiDirectTransport(context, ourId, keyManager)
+    private val relayTransport = RelayTransport(context, ourId)
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -79,7 +88,7 @@ class MeshNode(private val context: Context) {
 
     private val ackManager = AckManager(
         scope            = scope,
-        onRetry          = { packet, _ -> transmit(packet, packet.dstId) },
+        onRetry          = { packet, _ -> transmitOrRelay(packet, packet.dstId) },
         onDeliveryFailed = { packet ->
             Log.w(TAG, "Delivery failed for packet to ${packet.dstId.shortId()}")
             _incomingMessages.tryEmit(
@@ -110,7 +119,9 @@ class MeshNode(private val context: Context) {
         bleTransport.start()
         bleGattTransport.start()
         wifiTransport.start()
+        relayTransport.start()
         observeIncomingPackets()
+        observeRelayPackets()
         observePeerHandshakes()
         observeBleHandshakes()
         observeDiscoveredNodes()
@@ -123,6 +134,7 @@ class MeshNode(private val context: Context) {
         bleTransport.stop()
         bleGattTransport.stop()
         wifiTransport.stop()
+        relayTransport.stop()
         scope.cancel()
     }
 
@@ -142,6 +154,19 @@ class MeshNode(private val context: Context) {
             peer.bleAddress != null     -> { bleGattTransport.send(packet, peer.bleAddress); true }
             else -> false
         }
+    }
+
+    /**
+     * Send [packet] to [dest] via a local transport ([transmit]); if no local
+     * route exists, fall back to the internet relay (Phase 9, PROTOCOL.md §14)
+     * so the message can reach [dest] anywhere in the world, as long as both
+     * ends have a connection to a relay server. Never used for broadcasts —
+     * the relay only forwards unicast packets to a specific registered MeshID.
+     */
+    private fun transmitOrRelay(packet: MeshPacket, dest: MeshID): Boolean {
+        if (transmit(packet, dest)) return true
+        if (dest != MeshID.BROADCAST && relayTransport.send(packet)) return true
+        return false
     }
 
     // ── Send API ───────────────────────────────────────────────────────────────
@@ -212,6 +237,21 @@ class MeshNode(private val context: Context) {
         }
     }
 
+    /**
+     * Observe packets arriving via the internet relay (Phase 9). The relay only
+     * forwards unicast packets to the MeshID that registered for them, so every
+     * packet here is addressed to [ourId] — deliver directly to the app layer
+     * without involving local AODV routing (the sender isn't a local peer, so
+     * there's no local "next hop" to record).
+     */
+    private fun observeRelayPackets() {
+        scope.launch {
+            relayTransport.incomingPackets.collect { packet ->
+                if (packet.isForUs(ourId)) deliverToApp(packet)
+            }
+        }
+    }
+
     private fun route(packet: MeshPacket) {
         when (val decision = router.process(packet)) {
             is RoutingDecision.Deliver          -> deliverToApp(packet)
@@ -234,10 +274,10 @@ class MeshNode(private val context: Context) {
     }
 
     private fun dispatchPacket(packet: MeshPacket) {
-        val peer = peerRegistry.get(packet.dstId)
-        if (peer != null && transmit(packet, packet.dstId)) {
+        if (transmitOrRelay(packet, packet.dstId)) {
             if (packet.type == PacketType.MSG) {
-                val addr = peer.ipAddress.ifBlank { peer.bleAddress ?: "" }
+                val peer = peerRegistry.get(packet.dstId)
+                val addr = peer?.ipAddress?.ifBlank { peer.bleAddress ?: "relay" } ?: "relay"
                 ackManager.trackOutgoing(packet, addr)
             }
         } else {
@@ -291,7 +331,7 @@ class MeshNode(private val context: Context) {
             ttl     = MeshPacket.DEFAULT_TTL,
             payload = ackPayload
         )
-        if (transmit(ack, originalMsg.srcId)) {
+        if (transmitOrRelay(ack, originalMsg.srcId)) {
             Log.d(TAG, "ACK sent to ${originalMsg.srcId.shortId()}")
         }
     }

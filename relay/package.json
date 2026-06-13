@@ -1,0 +1,13 @@
+{
+  "name": "mrit-relay",
+  "version": "1.0.0",
+  "description": "MRIT relay/gateway server — forwards MMP packets between MeshIDs over the internet (PROTOCOL.md §14)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}

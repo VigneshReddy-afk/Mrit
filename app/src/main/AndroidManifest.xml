@@ -25,6 +25,9 @@
     <!-- ── Network state ───────────────────────────────────────────── -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- ── Relay/gateway transport (Phase 9) ───────────────────────── -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <!-- ── Required hardware ───────────────────────────────────────── -->
     <uses-feature android:name="android.hardware.wifi.direct" android:required="true" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />

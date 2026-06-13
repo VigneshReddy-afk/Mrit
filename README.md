@@ -8,7 +8,7 @@
 [![Android](https://img.shields.io/badge/Android-Kotlin-7F52FF?style=flat-square&logo=kotlin&logoColor=white)](#-project-structure)
 [![iOS](https://img.shields.io/badge/iOS-Swift-FA7343?style=flat-square&logo=swift&logoColor=white)](#-project-structure)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
-[![Phase](https://img.shields.io/badge/phase-8%20of%208-brightgreen?style=flat-square)](#️-roadmap)
+[![Phase](https://img.shields.io/badge/phase-9%20of%209-brightgreen?style=flat-square)](#️-roadmap)
 [![Spec](https://img.shields.io/badge/protocol-MMP%20v1-informational?style=flat-square)](PROTOCOL.md)
 
 MRIT is a **from-scratch mesh networking stack** for Android and iOS that lets phones
@@ -195,6 +195,38 @@ bridge — **every node runs both GATT roles at once**:
 
 ---
 
+## 🌐 Relay Network — MRIT Global <sub>· Phase 9</sub>
+
+Local radio (WiFi Direct / BLE) tops out around 100-200m per hop. **MRIT
+Global** adds an optional internet relay so two nodes anywhere in the world
+can reach each other — without weakening the trust model:
+
+- **Still end-to-end encrypted** — the relay is a dumb forwarder. It reads
+  only the 32-byte `DST_ID` field of an MMP packet to pick a connection;
+  payloads stay AES-256-GCM ciphertext the relay can never read.
+- **Additive, not required** — `transmitOrRelay()` tries local mesh delivery
+  first (`transmit()`, same as Phase 6/8). The relay is only used as a
+  fallback when no local route exists and the destination isn't broadcast.
+- **`RelayTransport`** (Android, OkHttp WebSocket) registers the device's own
+  MeshID with a relay server, exchanges packets framed as
+  `[0x00][MeshID]` (REGISTER) / `[0x01][MMP packet]` (PACKET), and
+  reconnects with the same 1s→30s exponential backoff as the BLE bridge.
+- **`relay/server.js`** — a ~50-line Node.js + `ws` server: an in-memory
+  `MeshID → connection` map, forwarding PACKET frames verbatim.
+
+```
+Node A ──(local mesh)──▶ Node B ──(no local route to D)──▶ relay ──▶ Node D
+                                                          (anywhere on the internet)
+```
+
+📖 See **[PROTOCOL.md §13](PROTOCOL.md)** for the full frame format, threat
+model, and known v1 limitations (no relay-side persistence, no
+gateway-on-behalf-of-peer, no REGISTER auth — mitigated by E2E encryption +
+self-certifying MeshIDs). See **[relay/README.md](relay/README.md)** for
+running/deploying the server.
+
+---
+
 ## 📥 Store-and-Forward
 
 Packets for unreachable peers are stored in SQLite for up to **24 hours**.
@@ -276,7 +308,9 @@ app/src/main/java/com/mrit/mesh/
 ├── transport/
 │   ├── WifiDirectTransport.kt  — data transfer + DISCOVER handshake over WiFi Direct
 │   ├── BLETransport.kt         — peer discovery over Bluetooth LE
-│   └── BleGattTransport.kt     — BLE GATT data bridge: fragmentation + handshake (Phase 6)
+│   ├── BleGattTransport.kt     — BLE GATT data bridge: fragmentation + handshake (Phase 6)
+│   ├── RelayFrame.kt           — REGISTER/PACKET wire framing for the relay link (Phase 9)
+│   └── RelayTransport.kt       — WebSocket relay/gateway client, exponential reconnect (Phase 9)
 ├── routing/
 │   └── AODVRouter.kt           — AODV routing engine (RREQ/RREP/route table)
 ├── reliability/
@@ -318,6 +352,11 @@ ios/                            — Swift Package (Phase 4)
     │   └── AckManager.swift    — ACK tracking + 3-retry logic, ports Android's AckManager (Phase 7)
     └── DSL/
         └── Mrit.swift          — high-level Mrit DSL: send/sendFile/sos + onMessage/onFile/onPeers (Phase 5)
+
+relay/                           — Node.js WebSocket relay/gateway server (Phase 9)
+├── server.js                   — dumb forwarder: registers MeshIDs, forwards MMP packets by DST_ID
+├── package.json                — depends on `ws`
+└── README.md                   — run/deploy instructions
 ```
 
 </details>
@@ -336,6 +375,7 @@ ios/                            — Swift Package (Phase 4)
 | **6** | ✅ | **BLE GATT transport bridge** for real iOS↔Android interop — `BleGattTransport` on Android (GATT central+peripheral) and Swift/CoreBluetooth on iOS, ATT-MTU fragmentation/reassembly, DISCOVER-based ECDH handshake, and transport-fallback routing (`MeshNode.transmit`) on both platforms |
 | **7** | ✅ | **iOS ACK-retry parity** — `AckManager.swift` ports Android's `AckManager.kt` (5s timeout, 3 retries, 1s check loop, SHA-256 fingerprint matching) so iOS now retries unacknowledged `MSG`s and reports delivery failure, closing the last cross-platform gap in PROTOCOL.md §9 |
 | **8** | ✅ | **BLE reliability hardening** — connection retry with exponential backoff (1s→30s), a 4-link CENTRAL connection cap on both platforms, and iOS CoreBluetooth state restoration. **Mesh topology visualization** — live radial graph of direct + multi-hop peers (`TopologyView`, Android). Outstanding: cross-platform field testing on real hardware (manual, hardware-dependent) |
+| **9** | ✅ | **MRIT Global — relay/gateway network**: `RelayTransport` (Android, OkHttp WebSocket) + `relay/server.js` extend reach beyond local radio range over the internet, with `transmitOrRelay()` falling back to the relay only when no local route exists. End-to-end encryption unchanged — the relay reads only the 32-byte `DST_ID` header. Outstanding: deploying a public relay instance, gateway-on-behalf-of-peer for offline-but-local mesh members |
 
 ---
 

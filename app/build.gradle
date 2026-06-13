@@ -66,6 +66,9 @@ dependencies {
     // RecyclerView (peer list + message log)
     implementation 'androidx.recyclerview:recyclerview:1.3.2'
 
+    // WebSocket client for the relay/gateway transport — Phase 9
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+
     // Encrypted key storage — Phase 4
     // EncryptedSharedPreferences wraps the EC private key with an Android Keystore
     // AES-256-GCM master key. Hardware-backed on devices with a Secure Enclave.
