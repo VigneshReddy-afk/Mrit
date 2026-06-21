@@ -20,7 +20,7 @@ talk directly to each other — hop by hop — entirely off-grid.
 
 ---
 
-## ✨ Why MRIT?
+### ✨ Why MRIT?
 
 | | |
 |---|---|
