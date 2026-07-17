@@ -2,7 +2,7 @@
 
 #### 📡 MRIT — Mobile Mesh Protocol
 
-### Phone-to-phone mesh network. No towers. No satellites. No infrastructure.
+#### Phone-to-phone mesh network. No towers. No satellites. No infrastructure.
 
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20iOS-blue?style=flat-square)](#-project-structure)
 [![Android](https://img.shields.io/badge/Android-Kotlin-7F52FF?style=flat-square&logo=kotlin&logoColor=white)](#-project-structure)
