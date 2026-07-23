@@ -1,6 +1,6 @@
 <div align="center">
 
-########### 📡 MRIT — Mobile Mesh Protocol
+############ 📡 MRIT — Mobile Mesh Protocol
 
 ### Phone-to-phone mesh network. No towers. No satellites. No infrastructure.
 
